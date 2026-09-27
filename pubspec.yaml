@@ -1,7 +1,7 @@
 name: myco16
 description: MYCO-16, sampler de poche Android (prototype).
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.3.0+3
 
 environment:
   sdk: ">=3.4.0 <4.0.0"

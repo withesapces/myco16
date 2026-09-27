@@ -1,9 +1,10 @@
-// Moteur : sons (SoLoud), micro, séquenceur 16 pas, FX punch-in,
-// arrangement (chaîne de patterns) et sauvegarde automatique du projet.
+// Moteur MYCO-16 : combinaisons de boutons, séquenceur, verrouillage de
+// paramètres, 16 effets, chaînes de patterns, micro, sauvegarde.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_soloud/flutter_soloud.dart';
@@ -11,23 +12,108 @@ import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 
 import 'dsp.dart';
+import 'sampler.dart';
 import 'synth.dart';
 
-enum Mode { sound, write, pattern, fx, rec }
+enum Btn { sound, pattern, bpm, fx, record, write, play }
+
+enum KnobMode { tone, filter, trim }
+
+enum Knob { a, b }
 
 const List<String> kFxNames = [
-  'LOOP16', 'LOOP8', 'LOOP4', 'STUT', //
-  'OCT+', 'OCT-', 'FIFTH', 'SCRTCH', //
-  'ECHO', 'RANDOM', 'REVRS', 'HALF', //
-  'DOUBLE', 'NO DRM', 'NO MEL', 'GATE',
+  'LOOP 16', 'LOOP 12', 'LOOP SHORT', 'LOOP SHORTER', //
+  'UNISON', 'UNISON LOW', 'OCTAVE UP', 'OCTAVE DOWN', //
+  'STUTTER 4', 'STUTTER 3', 'SCRATCH', 'SCRATCH FAST', //
+  '6/8 QUANTIZE', 'RETRIGGER', 'REVERSE', 'NO FX',
 ];
+const List<String> kFxShort = [
+  'L16', 'L12', 'LSH', 'LSR', 'UNI', 'UNL', 'OC+', 'OC-', //
+  'ST4', 'ST3', 'SCR', 'SCF', '6/8', 'RTG', 'REV', 'OFF',
+];
+const List<int> kBpmPresets = [80, 120, 140];
+const double kMaxMemory = 40; // secondes d'enregistrement
+
+class Step {
+  int note;
+  double? pitch, vol, filter, res; // verrous de paramètres
+  Step(this.note);
+
+  Step copy() => Step(note)
+    ..pitch = pitch
+    ..vol = vol
+    ..filter = filter
+    ..res = res;
+
+  List<Object?> toJson() => [note, pitch, vol, filter, res];
+
+  static Step fromJson(List<dynamic> j) {
+    double? d(int i) => i < j.length ? (j[i] as num?)?.toDouble() : null;
+    return Step((j[0] as num).toInt())
+      ..pitch = d(1)
+      ..vol = d(2)
+      ..filter = d(3)
+      ..res = d(4);
+  }
+}
+
+class Pattern {
+  final List<List<Step?>> tracks =
+      List.generate(16, (_) => List<Step?>.filled(16, null));
+  final List<int?> fx = List<int?>.filled(16, null);
+
+  bool get used => tracks.any((t) => t.any((s) => s != null));
+
+  void clear() {
+    for (final t in tracks) {
+      t.fillRange(0, 16, null);
+    }
+    fx.fillRange(0, 16, null);
+  }
+
+  void copyFrom(Pattern o) {
+    for (var s = 0; s < 16; s++) {
+      for (var k = 0; k < 16; k++) {
+        tracks[s][k] = o.tracks[s][k]?.copy();
+      }
+    }
+    fx.setAll(0, o.fx);
+  }
+
+  Map<String, dynamic> toJson() => {
+        'steps': [
+          for (var s = 0; s < 16; s++)
+            for (var k = 0; k < 16; k++)
+              if (tracks[s][k] != null) [s, k, ...tracks[s][k]!.toJson()]
+        ],
+        'fx': fx,
+      };
+
+  void fromJson(Map<String, dynamic> j) {
+    clear();
+    for (final e in (j['steps'] as List)) {
+      final l = e as List;
+      final s = (l[0] as num).toInt();
+      final k = (l[1] as num).toInt();
+      tracks[s][k] = Step.fromJson(l.sublist(2));
+    }
+    final f = j['fx'] as List;
+    for (var i = 0; i < 16 && i < f.length; i++) {
+      fx[i] = (f[i] as num?)?.toInt();
+    }
+  }
+}
 
 class _Pending {
   final int atUs;
   final int slot;
-  final double vol;
-  final double speed;
-  _Pending(this.atUs, this.slot, this.vol, this.speed);
+  final int note;
+  final Step? lock;
+  final double speedMul;
+  final double volMul;
+  final bool rev;
+  _Pending(this.atUs, this.slot, this.note, this.lock,
+      {this.speedMul = 1, this.volMul = 1, this.rev = false});
 }
 
 class Engine extends ChangeNotifier {
@@ -35,59 +121,95 @@ class Engine extends ChangeNotifier {
   final AudioRecorder _rec = AudioRecorder();
   final Random _rnd = Random();
 
-  // sons
-  final Map<String, AudioSource> _cache = {};
-  final List<String> padSound = List<String>.of(kKits[0].pads);
-  final List<double> padTune = List<double>.filled(16, 0); // demi-tons
-  final List<double> padVol = List<double>.filled(16, 1);
-  final List<String> micFiles = []; // mic_<horodatage>.wav
-
-  // patterns : 16 patterns x 16 pads x 16 pas
-  final List<List<List<bool>>> patterns = List.generate(
-      16, (_) => List.generate(16, (_) => List<bool>.filled(16, false)));
-
-  // arrangement
-  final List<int> song = [];
-  bool songMode = false;
-  int songIndex = 0;
+  // ── état ──
+  final List<Slot> slots = List<Slot>.generate(16, emptySlot);
+  final List<Pattern> patterns = List<Pattern>.generate(16, (_) => Pattern());
+  final List<int> chain = [0];
+  int chainIndex = 0;
 
   bool ready = false;
   String? error;
-  Mode mode = Mode.sound;
+  int sound = 8;
   int pattern = 0;
   int bpm = 140;
-  int selected = 8;
+  double swing = 0;
+  int masterVol = 10; // 1..16
+  bool writeMode = false;
   bool playing = false;
   int step = -1;
-  int? fx;
+  KnobMode knobMode = KnobMode.tone;
+  final List<int> lastNote = List<int>.generate(16, (i) => i < 8 ? 7 : 0);
+  int? liveFx;
   int? recordingSlot;
   bool processing = false;
-  final List<int> flash = List<int>.filled(16, 0);
 
+  // affichage / animation
+  String? lcdText;
+  int _lcdUntil = 0;
+  int lastHitMs = 0;
+  int lastKickMs = 0;
+  int lastActivityMs = DateTime.now().millisecondsSinceEpoch;
+  final List<int> keyFlash = List<int>.filled(16, 0);
+
+  // boutons maintenus
+  final Set<Btn> held = {};
+  final Map<Btn, bool> _usedWhileHeld = {};
+  final Map<Btn, int> _downAt = {};
+  bool _chainStarted = false;
+  bool _switchAtBar = false;
+
+  // horloge
   Directory? _dir;
   Timer? _timer;
   Timer? _saveTimer;
   Timer? _recTimeout;
+  Timer? _warmTimer;
   final Stopwatch _sw = Stopwatch();
-  int _nextUs = 0;
+  int _gridUs = 0;
   int _pos = 0;
   int _fxTick = 0;
-  int _fxAnchor = 0;
+  int? _fxKey;
+  int? _loopFx;
+  int _loopNextUs = 0;
+  int _lastHitStep = 0;
+  int? _prevStepFx;
   final List<_Pending> _pending = [];
 
-  // ── démarrage ─────────────────────────────
+  // voix pré-rendues
+  final Map<String, AudioSource> _voices = {};
+  final Set<String> _loading = {};
+  final List<int> _gen = List<int>.filled(16, 0);
+
+  int get _now => DateTime.now().millisecondsSinceEpoch;
+  double get masterGain => masterVol / 10;
+  int get position => _pos;
+  bool get idle => !playing && _now - lastActivityMs > 20000;
+  bool get chaining => chain.length > 1;
+  Slot get cur => slots[sound];
+
+  double get memoryUsed {
+    final files = <String>{};
+    var t = 0.0;
+    for (final s in slots) {
+      if (s.file != null && files.add(s.file!)) t += s.seconds;
+    }
+    return t;
+  }
+
+  // ═════════════ démarrage ═════════════
   Future<void> init() async {
     try {
       await _sl.init(bufferSize: 512);
       _dir = await getApplicationDocumentsDirectory();
-      _scanMics();
       final loaded = await _loadProject();
-      if (!loaded) _demoPattern();
-      for (var i = 0; i < 16; i++) {
-        if (await _source(padSound[i]) == null) {
-          padSound[i] = kKits[0].pads[i];
-          await _source(padSound[i]);
+      if (!loaded) {
+        for (var i = 0; i < 16; i++) {
+          slots[i] = factorySlot(i);
         }
+        _demo();
+      }
+      for (var i = 0; i < 16; i++) {
+        await _warmSlot(i);
       }
       ready = true;
     } catch (e) {
@@ -96,163 +218,179 @@ class Engine extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _scanMics() {
-    final d = _dir;
-    if (d == null) return;
-    final names = d
-        .listSync()
-        .whereType<File>()
-        .map((f) => f.uri.pathSegments.last)
-        .where((n) => n.startsWith('mic_') && n.endsWith('.wav'))
-        .toList()
-      ..sort();
-    micFiles
-      ..clear()
-      ..addAll(names);
-  }
-
-  void _demoPattern() {
+  void _demo() {
     final p = patterns[0];
+    // slot 9 = kit PSY : 0 kick, 4 ch, 6 oh, 3 clap
     for (var s = 0; s < 16; s += 4) {
-      p[8][s] = true;
+      p.tracks[8][s] = Step(0);
     }
-    for (var s = 2; s < 16; s += 4) {
-      p[12][s] = true;
+    for (final s in [2, 6, 10, 14]) {
+      p.tracks[8][s] = Step(6);
     }
-    for (final s in [1, 3, 5, 7, 9, 11, 13, 15]) {
-      p[11][s] = true;
+    for (final s in [4, 12]) {
+      p.tracks[8][s] = Step(3);
     }
+    // slot 2 = basse roulante sur la tonique
     for (final s in [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15]) {
-      p[0][s] = true;
+      p.tracks[1][s] = Step(7);
     }
-    p[10][4] = true;
-    p[10][12] = true;
-    p[5][14] = true;
+    p.tracks[1][15] = Step(8);
+    chain
+      ..clear()
+      ..add(0);
   }
 
-  // ── sons ──────────────────────────────────
-  String nameOf(String id) {
-    if (id.startsWith('mic:')) {
-      final i = micFiles.indexOf(id.substring(4));
-      return 'MIC ${i + 1}';
-    }
-    return kLibraryById[id]?.name ?? '?';
-  }
+  // ═════════════ voix ═════════════
+  String _vkey(int si, int slice, int fq, int rq, bool rev) =>
+      '$si:${_gen[si]}:$slice:$fq:$rq:${rev ? 1 : 0}';
 
-  String padName(int i) => nameOf(padSound[i]);
-  bool padIsMic(int i) => padSound[i].startsWith('mic:');
-
-  Future<AudioSource?> _source(String id) async {
-    final cached = _cache[id];
-    if (cached != null) return cached;
+  Future<void> _ensureVoice(int si, int slice, int fq, int rq, bool rev) async {
+    final k = _vkey(si, slice, fq, rq, rev);
+    if (_voices.containsKey(k) || _loading.contains(k)) return;
+    _loading.add(k);
     try {
-      AudioSource src;
-      if (id.startsWith('mic:')) {
-        final f = File('${_dir!.path}/${id.substring(4)}');
-        if (!await f.exists()) return null;
-        src = await _sl.loadFile(f.path);
-      } else {
-        final def = kLibraryById[id];
-        if (def == null) return null;
-        src = await _sl.loadMem('lib_$id.wav', toWav(def.gen()));
+      final data = renderVoice(slots[si], slice, fq, rq, rev);
+      if (data.isNotEmpty) {
+        _voices[k] = await _sl.loadMem('v_$k.wav', toWav(data));
       }
-      _cache[id] = src;
-      return src;
     } catch (_) {
-      return null;
+    } finally {
+      _loading.remove(k);
     }
   }
 
-  void _play(int slot, {double vol = 1, double speed = 1}) {
-    final src = _cache[padSound[slot]];
-    if (src == null) return;
-    flash[slot] = DateTime.now().millisecondsSinceEpoch;
-    try {
-      final h = _sl.play(src, volume: vol * padVol[slot]);
-      final sp = speed * pow(2, padTune[slot] / 12).toDouble();
-      if ((sp - 1).abs() > 1e-6) _sl.setRelativePlaySpeed(h, sp);
-    } catch (_) {}
-  }
-
-  void padPlay(int slot) {
-    selected = slot;
-    _play(slot);
-    notifyListeners();
-  }
-
-  void preview(int slot) => _play(slot);
-
-  Future<void> assignPad(int pad, String id) async {
-    if (await _source(id) == null) return;
-    padSound[pad] = id;
-    selected = pad;
-    _play(pad);
-    _changed();
-  }
-
-  void setTune(int pad, double semis) {
-    padTune[pad] = semis;
-    _changed();
-  }
-
-  void setVol(int pad, double v) {
-    padVol[pad] = v;
-    _changed();
-  }
-
-  Future<void> applyKit(int k) async {
-    final kit = kKits[k];
-    for (var i = 0; i < 16; i++) {
-      await _source(kit.pads[i]);
-      padSound[i] = kit.pads[i];
-      padTune[i] = 0;
-      padVol[i] = 1;
+  Future<void> _warmSlot(int si, {bool reverse = false}) async {
+    final s = slots[si];
+    if (s.isEmpty) return;
+    final fq = quantFilter(s.filter), rq = quantRes(s.res);
+    for (var sl = 0; sl < s.sliceCount; sl++) {
+      await _ensureVoice(si, sl, 0, 0, false);
+      if (fq != 0) await _ensureVoice(si, sl, fq, rq, false);
+      if (reverse) await _ensureVoice(si, sl, fq, rq, true);
     }
-    _changed();
   }
 
-  Future<void> deleteMic(String file) async {
-    final id = 'mic:$file';
-    for (var i = 0; i < 16; i++) {
-      if (padSound[i] == id) {
-        padSound[i] = kKits[0].pads[i];
-        await _source(padSound[i]);
+  /// Invalide les voix d'un slot (données ou trim modifiés).
+  void _invalidate(int si) {
+    final prefix = '$si:${_gen[si]}:';
+    final old = _voices.keys.where((k) => k.startsWith(prefix)).toList();
+    for (final k in old) {
+      final src = _voices.remove(k);
+      if (src != null) {
+        _sl.disposeSource(src).catchError((_) {});
       }
     }
-    final src = _cache.remove(id);
-    if (src != null) {
-      try {
-        await _sl.disposeSource(src);
-      } catch (_) {}
-    }
-    try {
-      await File('${_dir!.path}/$file').delete();
-    } catch (_) {}
-    micFiles.remove(file);
-    _changed();
+    _gen[si]++;
   }
 
-  // ── séquenceur ─────────────────────────────
+  void _scheduleWarm(int si) {
+    _warmTimer?.cancel();
+    _warmTimer = Timer(const Duration(milliseconds: 150), () => _warmSlot(si));
+  }
+
+  void _trigger(int si, int key,
+      {Step? lock, double speedMul = 1, double volMul = 1, double pan = 0, bool rev = false}) {
+    final s = slots[si];
+    if (s.isEmpty) return;
+    final slice = s.sliceForKey(key);
+    final fq = quantFilter(lock?.filter ?? s.filter);
+    final rq = quantRes(lock?.res ?? s.res);
+    final pitch = lock?.pitch ?? s.pitch;
+    final vol = lock?.vol ?? s.vol;
+    var src = _voices[_vkey(si, slice, fq, rq, rev)];
+    if (src == null) {
+      _ensureVoice(si, slice, fq, rq, rev);
+      src = _voices[_vkey(si, slice, 0, 0, false)];
+      if (src == null) {
+        _ensureVoice(si, slice, 0, 0, false);
+        return;
+      }
+    }
+    final semis = pitch + (s.drum ? 0 : kScale[key]);
+    final speed = pow(2, semis / 12).toDouble() * speedMul;
+    try {
+      final h = _sl.play(src, volume: vol * volMul * masterGain, pan: pan);
+      if ((speed - 1).abs() > 1e-6) _sl.setRelativePlaySpeed(h, speed);
+    } catch (_) {}
+    final now = _now;
+    lastHitMs = now;
+    if (s.drum && slice <= 1) lastKickMs = now;
+    if (si == sound) keyFlash[key] = now;
+  }
+
+  /// Déclenche une note en appliquant l'effet actif.
+  void _hit(int si, int note, Step? lock, int? fx, int atUs) {
+    final st = _stepUs;
+    switch (fx) {
+      case 4: // unison
+        _trigger(si, note, lock: lock, speedMul: 1.0087, pan: -0.7, volMul: 0.8);
+        _trigger(si, note, lock: lock, speedMul: 0.9913, pan: 0.7, volMul: 0.8);
+        break;
+      case 5: // unison low
+        _trigger(si, note, lock: lock, speedMul: 1.0087, pan: -0.7, volMul: 0.7);
+        _trigger(si, note, lock: lock, speedMul: 0.9913, pan: 0.7, volMul: 0.7);
+        _trigger(si, note, lock: lock, speedMul: 0.5, volMul: 0.7);
+        break;
+      case 6:
+        _trigger(si, note, lock: lock, speedMul: 2);
+        break;
+      case 7:
+        _trigger(si, note, lock: lock, speedMul: 0.5);
+        break;
+      case 8:
+      case 9:
+        {
+          final n = fx == 8 ? 4 : 3;
+          _trigger(si, note, lock: lock);
+          for (var j = 1; j < n; j++) {
+            _pending.add(_Pending(atUs + st * j ~/ n, si, note, lock));
+          }
+        }
+        break;
+      case 10:
+        _trigger(si, note, lock: lock);
+        _pending.add(_Pending(atUs + st ~/ 2, si, note, lock, rev: true, speedMul: 1.2));
+        break;
+      case 11:
+        _trigger(si, note, lock: lock, speedMul: 1.1);
+        for (var j = 1; j < 4; j++) {
+          _pending.add(_Pending(atUs + st * j ~/ 4, si, note, lock,
+              rev: j.isOdd, speedMul: j.isOdd ? 1.3 : 1.1));
+        }
+        break;
+      case 14:
+        _trigger(si, note, lock: lock, rev: true);
+        break;
+      default:
+        _trigger(si, note, lock: lock);
+    }
+  }
+
+  // ═════════════ séquenceur ═════════════
   int get _stepUs => (60000000 / bpm / 4).round();
 
   void togglePlay() {
+    _touch();
     if (playing) {
       playing = false;
       _timer?.cancel();
       _sw.stop();
       _pending.clear();
+      _loopFx = null;
       step = -1;
     } else {
       playing = true;
       _pos = 0;
-      if (songMode && song.isNotEmpty) {
-        songIndex = 0;
-        pattern = song[0];
+      _fxTick = 0;
+      if (chain.isNotEmpty) {
+        chainIndex = 0;
+        pattern = chain[0];
       }
+      _switchAtBar = false;
       _sw
         ..reset()
         ..start();
-      _nextUs = 0;
+      _gridUs = 0;
       _timer = Timer.periodic(const Duration(milliseconds: 2), (_) => _tick());
     }
     notifyListeners();
@@ -260,208 +398,492 @@ class Engine extends ChangeNotifier {
 
   void _tick() {
     final now = _sw.elapsedMicroseconds;
+    var changed = false;
     if (_pending.isNotEmpty) {
       final due = _pending.where((p) => p.atUs <= now).toList();
-      _pending.removeWhere((p) => p.atUs <= now);
-      for (final p in due) {
-        _play(p.slot, vol: p.vol, speed: p.speed);
+      if (due.isNotEmpty) {
+        _pending.removeWhere((p) => p.atUs <= now);
+        for (final p in due) {
+          _trigger(p.slot, p.note,
+              lock: p.lock, speedMul: p.speedMul, volMul: p.volMul, rev: p.rev);
+        }
       }
     }
-    var changed = false;
-    while (now >= _nextUs) {
-      final isStutter = fx == 3;
-      _doStep(_nextUs);
-      _nextUs += isStutter ? _stepUs ~/ 2 : _stepUs;
+    final loop = _loopFx;
+    if (loop != null) {
+      const ratios = [1.0, 4 / 3, 0.5, 0.25];
+      final interval = (_stepUs * ratios[loop]).round();
+      while (now >= _loopNextUs) {
+        final pat = patterns[pattern];
+        for (var s = 0; s < 16; s++) {
+          final st = pat.tracks[s][_lastHitStep];
+          if (st != null) _trigger(s, st.note, lock: st);
+        }
+        _loopNextUs += interval;
+      }
+    }
+    while (true) {
+      final delay = _pos.isOdd ? (swing * _stepUs * 0.5).round() : 0;
+      if (now < _gridUs + delay) break;
+      _doStep(_gridUs + delay);
+      _gridUs += _stepUs;
       changed = true;
     }
     if (changed) notifyListeners();
   }
 
   void _doStep(int atUs) {
-    final f = fx;
-    int play = _pos;
-    bool trigger = true;
-    double speed = 1;
-    bool stutterSub = false;
-
-    if (f != null) {
-      final k = _fxTick;
-      switch (f) {
-        case 0:
-          play = _fxAnchor;
-          break;
-        case 1:
-          play = (_fxAnchor + k % 2) % 16;
-          break;
-        case 2:
-          play = (_fxAnchor + k % 4) % 16;
-          break;
-        case 3:
-          play = _fxAnchor;
-          stutterSub = true;
-          break;
-        case 4:
-          speed = 2;
-          break;
-        case 5:
-          speed = 0.5;
-          break;
-        case 6:
-          speed = 1.4983;
-          break;
-        case 7:
-          speed = k.isEven ? 0.7 : 1.35;
-          break;
-        case 9:
-          play = _rnd.nextInt(16);
-          break;
-        case 10:
-          play = ((_fxAnchor - k) % 16 + 16) % 16;
-          break;
-        case 11:
-          play = (_fxAnchor + k ~/ 2) % 16;
-          trigger = k.isEven;
-          break;
-        case 12:
-          play = (_fxAnchor + k * 2) % 16;
-          break;
-        case 15:
-          trigger = k.isEven;
-          break;
-      }
-      _fxTick++;
+    final pat = patterns[pattern];
+    // FX enregistrés dans le pattern (FX maintenu + mode écriture)
+    if (writeMode && liveFx != null && held.contains(Btn.fx)) {
+      pat.fx[_pos] = liveFx == 15 ? null : liveFx;
     }
+    final fx = liveFx ?? pat.fx[_pos];
+    if (fx != _prevStepFx) _fxTick = 0;
+    _prevStepFx = fx;
+
+    // effets de boucle : l'horloge de boucle prend le relais
+    if (fx != null && fx <= 3) {
+      if (_loopFx != fx) {
+        _loopFx = fx;
+        _loopNextUs = atUs;
+      }
+    } else {
+      _loopFx = null;
+    }
+
+    var play = _pos;
+    var trig = _loopFx == null;
+    if (fx == 12 && _pos % 4 == 3) trig = false; // 6/8
+    if (fx == 13) play = _fxTick % 16; // retrigger : repart du pas 1
 
     step = play;
-    if (trigger) {
-      final p = patterns[pattern];
+    if (trig) {
+      var any = false;
       for (var s = 0; s < 16; s++) {
-        if (!p[s][play]) continue;
-        if (f == 13 && s >= 8) continue;
-        if (f == 14 && s < 8) continue;
-        _play(s, speed: speed);
-        if (f == 8) {
-          _pending.add(_Pending(atUs + _stepUs * 3, s, 0.45, speed));
-          _pending.add(_Pending(atUs + _stepUs * 6, s, 0.2, speed));
+        final st = pat.tracks[s][play];
+        if (st == null) continue;
+        _hit(s, st.note, st, fx, atUs);
+        any = true;
+      }
+      if (any) _lastHitStep = play;
+    }
+    _fxTick++;
+    _pos = (_pos + 1) % 16;
+    if (_pos == 0) _barEnd();
+  }
+
+  void _barEnd() {
+    if (_switchAtBar) {
+      _switchAtBar = false;
+      chainIndex = 0;
+      pattern = chain[0];
+    } else if (chain.length > 1) {
+      chainIndex = (chainIndex + 1) % chain.length;
+      pattern = chain[chainIndex];
+    }
+  }
+
+  // ═════════════ boutons ═════════════
+  void _touch() => lastActivityMs = _now;
+
+  void _lcd(String t) {
+    lcdText = t;
+    _lcdUntil = _now + 1300;
+  }
+
+  String? get lcdTransient => _now < _lcdUntil ? lcdText : null;
+
+  void _markUsed() {
+    for (final b in held) {
+      _usedWhileHeld[b] = true;
+    }
+  }
+
+  void btnDown(Btn b) {
+    _touch();
+    _markUsed(); // un bouton pressé pendant qu'un autre est tenu = combinaison
+    held.add(b);
+    _usedWhileHeld[b] = false;
+    _downAt[b] = _now;
+    switch (b) {
+      case Btn.play:
+        togglePlay();
+        break;
+      case Btn.pattern:
+        _chainStarted = false;
+        if (held.contains(Btn.record)) {
+          patterns[pattern].clear();
+          _lcd('CLR');
+          _usedWhileHeld[b] = true;
+          _changed();
         }
+        break;
+      case Btn.sound:
+        if (held.contains(Btn.record)) {
+          _deleteSound(sound);
+          _usedWhileHeld[b] = true;
+        }
+        break;
+      case Btn.record:
+        if (held.contains(Btn.pattern)) {
+          patterns[pattern].clear();
+          _lcd('CLR');
+          _usedWhileHeld[b] = true;
+          _changed();
+        }
+        break;
+      default:
+        break;
+    }
+    notifyListeners();
+  }
+
+  void btnUp(Btn b) {
+    held.remove(b);
+    final tap = _usedWhileHeld[b] != true && _now - (_downAt[b] ?? 0) < 450;
+    if (tap) {
+      switch (b) {
+        case Btn.write:
+          writeMode = !writeMode;
+          _lcd(writeMode ? 'WR' : '--');
+          break;
+        case Btn.fx:
+          knobMode = KnobMode.values[(knobMode.index + 1) % 3];
+          _lcd(['TON', 'FLT', 'TRM'][knobMode.index]);
+          break;
+        case Btn.bpm:
+          {
+            final i = kBpmPresets.indexOf(bpm);
+            bpm = kBpmPresets[(i + 1) % kBpmPresets.length];
+            _lcd('$bpm');
+            _changed();
+          }
+          break;
+        default:
+          break;
       }
     }
-    if (!stutterSub || _fxTick.isEven) {
-      _pos = (_pos + 1) % 16;
-      // fin de mesure : on passe au bloc suivant de l'arrangement
-      if (_pos == 0 && songMode && song.isNotEmpty) {
-        songIndex = (songIndex + 1) % song.length;
-        pattern = song[songIndex];
+    if (b == Btn.fx) {
+      liveFx = null;
+      _fxKey = null;
+    }
+    notifyListeners();
+  }
+
+  Future<String?> keyDown(int k) async {
+    _touch();
+    _markUsed();
+    if (held.contains(Btn.record)) {
+      return recStart(k);
+    }
+    if (held.contains(Btn.sound)) {
+      if (held.contains(Btn.write)) {
+        slots[k] = cur.copy();
+        _invalidate(k);
+        await _warmSlot(k);
+        _lcd('CPY');
+      } else {
+        sound = k;
+        _lcd('S${k + 1}');
       }
+      _changed();
+      return null;
+    }
+    if (held.contains(Btn.pattern)) {
+      if (held.contains(Btn.write)) {
+        patterns[k].copyFrom(patterns[pattern]);
+        _lcd('P${k + 1}');
+        _changed();
+        return null;
+      }
+      if (!_chainStarted) {
+        _chainStarted = true;
+        chain
+          ..clear()
+          ..add(k);
+        if (playing) {
+          _switchAtBar = true;
+        } else {
+          pattern = k;
+          chainIndex = 0;
+        }
+      } else if (chain.length < 128) {
+        chain.add(k);
+      }
+      _lcd(chain.length > 1 ? 'C${chain.length}' : 'P${k + 1}');
+      _changed();
+      return null;
+    }
+    if (held.contains(Btn.bpm)) {
+      masterVol = k + 1;
+      _lcd('V${k + 1}');
+      _changed();
+      return null;
+    }
+    if (held.contains(Btn.fx)) {
+      if (k == 15) {
+        if (writeMode) patterns[pattern].fx.fillRange(0, 16, null);
+        liveFx = null;
+        _lcd('OFF');
+      } else {
+        liveFx = k;
+        _fxKey = k;
+        _fxTick = 0;
+        if (k == 14) {
+          for (var s = 0; s < 16; s++) {
+            _warmSlot(s, reverse: true);
+          }
+        }
+        if (k == 10 || k == 11) {
+          for (var s = 0; s < 16; s++) {
+            _warmSlot(s, reverse: true);
+          }
+        }
+        if (k <= 3 && playing) {
+          _loopFx = k;
+          _loopNextUs = _sw.elapsedMicroseconds;
+        }
+        _lcd(kFxShort[k]);
+      }
+      if (writeMode) _changed();
+      notifyListeners();
+      return null;
+    }
+    if (held.contains(Btn.write) && playing) {
+      // enregistrement live, quantifié au pas le plus proche
+      final now = _sw.elapsedMicroseconds;
+      final prevStart = _gridUs - _stepUs;
+      final q = now - prevStart < _stepUs ~/ 2 ? (_pos + 15) % 16 : _pos;
+      patterns[pattern].tracks[sound][q] = Step(k);
+      lastNote[sound] = k;
+      _trigger(sound, k);
+      _changed();
+      return null;
+    }
+    if (writeMode) {
+      final t = patterns[pattern].tracks[sound];
+      if (t[k] == null) {
+        t[k] = Step(lastNote[sound]);
+        if (!playing) _trigger(sound, lastNote[sound]);
+      } else {
+        t[k] = null;
+      }
+      _changed();
+      return null;
+    }
+    // jeu direct
+    lastNote[sound] = k;
+    _hit(sound, k, null, liveFx, _sw.elapsedMicroseconds);
+    notifyListeners();
+    return null;
+  }
+
+  Future<String?> keyUp(int k) async {
+    if (recordingSlot == k) return recStop();
+    if (_fxKey == k && liveFx != null) {
+      liveFx = null;
+      _fxKey = null;
+      notifyListeners();
+    }
+    return null;
+  }
+
+  // ═════════════ knobs A / B ═════════════
+  String knobLabel(Knob k) {
+    if (held.contains(Btn.bpm)) return k == Knob.a ? 'SWING' : 'TEMPO';
+    switch (knobMode) {
+      case KnobMode.tone:
+        return k == Knob.a ? 'PITCH' : 'VOL';
+      case KnobMode.filter:
+        return k == Knob.a ? 'FILTRE' : 'RÉSO';
+      case KnobMode.trim:
+        return k == Knob.a ? 'DÉBUT' : 'LONG.';
     }
   }
 
-  void fxDown(int i) {
-    fx = i;
-    _fxTick = 0;
-    final base = i == 1 ? 2 : (i == 2 ? 4 : 1);
-    _fxAnchor = playing ? (_pos - (_pos % base)) % 16 : 0;
-    notifyListeners();
-  }
-
-  void fxUp(int i) {
-    if (fx == i) fx = null;
-    notifyListeners();
-  }
-
-  void toggleStep(int s) {
-    final t = patterns[pattern][selected];
-    t[s] = !t[s];
-    if (t[s] && !playing) _play(selected);
-    _changed();
-  }
-
-  void clearTrack() {
-    patterns[pattern][selected].fillRange(0, 16, false);
-    _changed();
-  }
-
-  void selectPattern(int p) {
-    pattern = p;
-    notifyListeners();
-  }
-
-  bool patternUsed(int p) => patterns[p].any((t) => t.contains(true));
-
-  void copyPattern(int from, int to) {
-    for (var s = 0; s < 16; s++) {
-      patterns[to][s] = List<bool>.of(patterns[from][s]);
+  /// Valeur normalisée 0..1 du knob (pour l'afficher).
+  double knobValue(Knob k) {
+    if (held.contains(Btn.bpm)) {
+      return k == Knob.a ? swing : (bpm - 60) / 180;
     }
-    pattern = to;
-    _changed();
+    final s = cur;
+    final sl = lastNote[sound] % 16;
+    switch (knobMode) {
+      case KnobMode.tone:
+        return k == Knob.a ? (s.pitch + 12) / 24 : s.vol;
+      case KnobMode.filter:
+        return k == Knob.a ? (s.filter + 1) / 2 : s.res;
+      case KnobMode.trim:
+        if (s.drum) {
+          return k == Knob.a ? s.sliceStart[sl] / 0.95 : s.sliceLen[sl];
+        }
+        return k == Knob.a ? s.trimStart / 0.95 : s.trimLen;
+    }
   }
 
-  void clearPattern(int p) {
-    for (final t in patterns[p]) {
-      t.fillRange(0, 16, false);
+  void knobTurn(Knob k, double delta) {
+    _touch();
+    _markUsed();
+    if (held.contains(Btn.bpm)) {
+      if (k == Knob.a) {
+        swing = (swing + delta).clamp(0.0, 1.0).toDouble();
+        _lcd('SW${(swing * 99).round()}');
+      } else {
+        bpm = (bpm + delta * 180).round().clamp(60, 240).toInt();
+        _lcd('$bpm');
+      }
+      _changed();
+      return;
+    }
+    final s = cur;
+    // verrouillage de paramètre : WRITE maintenu pendant la lecture
+    if (held.contains(Btn.write) && playing && knobMode != KnobMode.trim) {
+      final st = patterns[pattern].tracks[sound][step < 0 ? 0 : step];
+      if (st != null) {
+        switch (knobMode) {
+          case KnobMode.tone:
+            if (k == Knob.a) {
+              st.pitch = ((st.pitch ?? s.pitch) + delta * 24).clamp(-12.0, 12.0).toDouble();
+              _lcd(_signed(st.pitch!.round()));
+            } else {
+              st.vol = ((st.vol ?? s.vol) + delta).clamp(0.0, 1.0).toDouble();
+              _lcd('${(st.vol! * 99).round()}');
+            }
+            break;
+          case KnobMode.filter:
+            if (k == Knob.a) {
+              st.filter = ((st.filter ?? s.filter) + delta * 2).clamp(-1.0, 1.0).toDouble();
+              _lcd(_signed((st.filter! * 10).round()));
+            } else {
+              st.res = ((st.res ?? s.res) + delta).clamp(0.0, 1.0).toDouble();
+              _lcd('${(st.res! * 99).round()}');
+            }
+            _ensureVoice(sound, s.sliceForKey(st.note), quantFilter(st.filter ?? s.filter),
+                quantRes(st.res ?? s.res), false);
+            break;
+          case KnobMode.trim:
+            break;
+        }
+        _changed();
+      }
+      return;
+    }
+    switch (knobMode) {
+      case KnobMode.tone:
+        if (k == Knob.a) {
+          s.pitch = (s.pitch + delta * 24).clamp(-12.0, 12.0).toDouble();
+          _lcd(_signed(s.pitch.round()));
+        } else {
+          s.vol = (s.vol + delta).clamp(0.0, 1.0).toDouble();
+          _lcd('${(s.vol * 99).round()}');
+        }
+        break;
+      case KnobMode.filter:
+        if (k == Knob.a) {
+          s.filter = (s.filter + delta * 2).clamp(-1.0, 1.0).toDouble();
+          _lcd(_signed((s.filter * 10).round()));
+        } else {
+          s.res = (s.res + delta).clamp(0.0, 1.0).toDouble();
+          _lcd('${(s.res * 99).round()}');
+        }
+        _scheduleWarm(sound);
+        break;
+      case KnobMode.trim:
+        final int sl = s.drum ? s.sliceForKey(lastNote[sound]) : 0;
+        if (k == Knob.a) {
+          if (s.drum) {
+            s.sliceStart[sl] = (s.sliceStart[sl] + delta).clamp(0.0, 0.95).toDouble();
+            _lcd('${(s.sliceStart[sl] * 99).round()}');
+          } else {
+            s.trimStart = (s.trimStart + delta).clamp(0.0, 0.95).toDouble();
+            _lcd('${(s.trimStart * 99).round()}');
+          }
+        } else {
+          if (s.drum) {
+            s.sliceLen[sl] = (s.sliceLen[sl] + delta).clamp(0.02, 1.0).toDouble();
+            _lcd('${(s.sliceLen[sl] * 99).round()}');
+          } else {
+            s.trimLen = (s.trimLen + delta).clamp(0.02, 1.0).toDouble();
+            _lcd('${(s.trimLen * 99).round()}');
+          }
+        }
+        _invalidate(sound);
+        _scheduleWarm(sound);
+        break;
     }
     _changed();
   }
 
-  void setMode(Mode m) {
-    mode = mode == m && m != Mode.sound ? Mode.sound : m;
-    notifyListeners();
+  /// Relâchement d'un knob : on fait entendre le son réglé.
+  void knobRelease() {
+    if (!playing && !held.contains(Btn.bpm)) _trigger(sound, lastNote[sound]);
   }
 
-  void setBpm(int v) {
-    bpm = v.clamp(60, 200);
+  String _signed(int v) => v > 0 ? '+$v' : '$v';
+
+  // ═════════════ sons ═════════════
+  void _deleteSound(int si) {
+    _invalidate(si);
+    slots[si] = emptySlot(si);
+    _lcd('DEL');
     _changed();
   }
 
-  // ── arrangement ────────────────────────────
-  void songAdd(int p) {
-    song.add(p);
+  Future<void> loadLibrarySound(String id) async {
+    final def = kLibraryById[id];
+    if (def == null) return;
+    _invalidate(sound);
+    final s = cur.drum
+        ? Slot(name: def.name, drum: true, data: def.gen(), factory: 'mel:$id')
+        : melodicFromLibrary(id);
+    slots[sound] = s;
+    await _warmSlot(sound);
+    _trigger(sound, lastNote[sound]);
     _changed();
   }
 
-  void songRemoveAt(int i) {
-    if (i < 0 || i >= song.length) return;
-    song.removeAt(i);
-    if (songIndex >= song.length) songIndex = 0;
+  Future<void> loadKit(int k) async {
+    _invalidate(sound);
+    final s = drumFromKit(k);
+    if (!cur.drum) s.drum = false;
+    slots[sound] = s;
+    await _warmSlot(sound);
+    _trigger(sound, lastNote[sound]);
     _changed();
   }
 
-  void songSet(int i, int p) {
-    song[i] = p;
-    _changed();
-  }
-
-  void songMove(int oldIndex, int newIndex) {
-    if (newIndex > oldIndex) newIndex -= 1;
-    final v = song.removeAt(oldIndex);
-    song.insert(newIndex, v);
-    _changed();
-  }
-
-  void songClear() {
-    song.clear();
-    songIndex = 0;
-    _changed();
-  }
-
-  void setSongMode(bool on) {
-    songMode = on;
-    if (on && song.isNotEmpty && !playing) {
-      songIndex = 0;
-      pattern = song[0];
+  Future<void> resetFactory() async {
+    for (var i = 0; i < 16; i++) {
+      _invalidate(i);
+      slots[i] = factorySlot(i);
+      await _warmSlot(i);
     }
     _changed();
   }
 
-  /// Durée de l'arrangement en secondes (1 bloc = 1 mesure de 16 pas).
-  double get songSeconds => song.length * 16 * 60 / bpm / 4;
+  void clearAllPatterns() {
+    for (final p in patterns) {
+      p.clear();
+    }
+    chain
+      ..clear()
+      ..add(0);
+    pattern = 0;
+    _changed();
+  }
 
-  // ── enregistrement micro ───────────────────
+  // ═════════════ micro ═════════════
   Future<String?> recStart(int slot) async {
     if (recordingSlot != null || processing) return null;
+    final free = kMaxMemory - memoryUsed;
+    if (free < 0.3) {
+      _lcd('FUL');
+      notifyListeners();
+      return 'Mémoire pleine (40 s). Supprime un son : REC + SOUND.';
+    }
     try {
       if (!await _rec.hasPermission()) return 'Autorise le micro dans les réglages';
-      final path = '${_dir!.path}/rec_raw.wav';
       await _rec.start(
         const RecordConfig(
           encoder: AudioEncoder.wav,
@@ -471,11 +893,12 @@ class Engine extends ChangeNotifier {
           echoCancel: false,
           noiseSuppress: false,
         ),
-        path: path,
+        path: '${_dir!.path}/rec_raw.wav',
       );
       recordingSlot = slot;
-      selected = slot;
-      _recTimeout = Timer(const Duration(seconds: 6), () => recStop());
+      sound = slot;
+      final maxMs = (min(free, 20.0) * 1000).round();
+      _recTimeout = Timer(Duration(milliseconds: maxMs), () => recStop());
       notifyListeners();
       return null;
     } catch (e) {
@@ -483,8 +906,6 @@ class Engine extends ChangeNotifier {
     }
   }
 
-  /// Arrête l'enregistrement, nettoie le son et l'assigne au pad.
-  /// Renvoie un message à afficher, ou null si tout va bien.
   Future<String?> recStop() async {
     final slot = recordingSlot;
     if (slot == null) return null;
@@ -498,15 +919,22 @@ class Engine extends ChangeNotifier {
       final bytes = await File(path).readAsBytes();
       final cleaned = await compute(cleanRecording, bytes);
       if (cleaned.isEmpty) return 'Rien entendu : rapproche-toi du micro';
-      final name = 'mic_${DateTime.now().millisecondsSinceEpoch}.wav';
+      final data = decodeWav(cleaned);
+      if (data == null) return 'Enregistrement illisible';
+      final name = 'mic_${_now}.wav';
       await File('${_dir!.path}/$name').writeAsBytes(cleaned);
-      micFiles.add(name);
-      final id = 'mic:$name';
-      _cache[id] = await _sl.loadMem(name, cleaned);
-      padSound[slot] = id;
-      padTune[slot] = 0;
-      padVol[slot] = 1;
-      _play(slot);
+      final drum = slot >= 8;
+      _invalidate(slot);
+      slots[slot] = Slot(
+        name: 'MIC ${slot + 1}',
+        drum: drum,
+        data: data,
+        slices: drum ? detectSlices(data) : null,
+        file: name,
+      );
+      await _warmSlot(slot);
+      _trigger(slot, drum ? 0 : 7);
+      _lcd(drum ? '${slots[slot].sliceCount}SL' : 'OK');
       _changed();
       return null;
     } catch (e) {
@@ -517,77 +945,122 @@ class Engine extends ChangeNotifier {
     }
   }
 
-  // ── sauvegarde ─────────────────────────────
+  // ═════════════ arrangement (chaîne) ═════════════
+  void chainAdd(int p) {
+    if (chain.length < 128) chain.add(p);
+    _changed();
+  }
+
+  void chainRemoveAt(int i) {
+    if (chain.length <= 1) return;
+    chain.removeAt(i);
+    if (chainIndex >= chain.length) chainIndex = 0;
+    _changed();
+  }
+
+  void chainSet(int i, int p) {
+    chain[i] = p;
+    _changed();
+  }
+
+  void chainMove(int oldIndex, int newIndex) {
+    if (newIndex > oldIndex) newIndex -= 1;
+    final v = chain.removeAt(oldIndex);
+    chain.insert(newIndex, v);
+    _changed();
+  }
+
+  void chainReset() {
+    chain
+      ..clear()
+      ..add(pattern);
+    chainIndex = 0;
+    _changed();
+  }
+
+  double get chainSeconds => chain.length * 16 * 60 / bpm / 4;
+
+  // ═════════════ sauvegarde ═════════════
   void _changed() {
     notifyListeners();
     _saveTimer?.cancel();
     _saveTimer = Timer(const Duration(milliseconds: 800), _saveProject);
   }
 
-  int _bits(List<bool> t) {
-    var b = 0;
-    for (var i = 0; i < 16; i++) {
-      if (t[i]) b |= 1 << i;
-    }
-    return b;
-  }
-
   Future<void> _saveProject() async {
     final d = _dir;
     if (d == null) return;
     final data = {
-      'v': 1,
+      'v': 3,
       'bpm': bpm,
+      'swing': swing,
+      'masterVol': masterVol,
+      'sound': sound,
       'pattern': pattern,
-      'padSound': padSound,
-      'padTune': padTune,
-      'padVol': padVol,
-      'patterns': [
-        for (final p in patterns) [for (final t in p) _bits(t)]
-      ],
-      'song': song,
-      'songMode': songMode,
+      'chain': chain,
+      'slots': [for (final s in slots) s.paramsJson()],
+      'patterns': [for (final p in patterns) p.toJson()],
     };
     try {
-      await File('${d.path}/project.json').writeAsString(jsonEncode(data));
+      await File('${d.path}/project3.json').writeAsString(jsonEncode(data));
     } catch (_) {}
   }
 
   Future<bool> _loadProject() async {
     final d = _dir;
     if (d == null) return false;
-    final f = File('${d.path}/project.json');
+    final f = File('${d.path}/project3.json');
     if (!await f.exists()) return false;
     try {
       final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
       bpm = (j['bpm'] as num).toInt();
+      swing = (j['swing'] as num).toDouble();
+      masterVol = (j['masterVol'] as num).toInt();
+      sound = (j['sound'] as num).toInt();
       pattern = (j['pattern'] as num).toInt();
-      final ps = (j['padSound'] as List).cast<String>();
-      final pt = (j['padTune'] as List).map((e) => (e as num).toDouble()).toList();
-      final pv = (j['padVol'] as List).map((e) => (e as num).toDouble()).toList();
-      for (var i = 0; i < 16; i++) {
-        padSound[i] = ps[i];
-        padTune[i] = pt[i];
-        padVol[i] = pv[i];
-      }
-      final pats = j['patterns'] as List;
-      for (var p = 0; p < 16; p++) {
-        final tracks = pats[p] as List;
-        for (var s = 0; s < 16; s++) {
-          final bits = (tracks[s] as num).toInt();
-          for (var k = 0; k < 16; k++) {
-            patterns[p][s][k] = (bits >> k) & 1 == 1;
-          }
-        }
-      }
-      song
+      chain
         ..clear()
-        ..addAll((j['song'] as List).map((e) => (e as num).toInt()));
-      songMode = j['songMode'] == true;
+        ..addAll((j['chain'] as List).map((e) => (e as num).toInt()));
+      if (chain.isEmpty) chain.add(pattern);
+      final sj = j['slots'] as List;
+      for (var i = 0; i < 16; i++) {
+        slots[i] = await _slotFromJson(i, sj[i] as Map<String, dynamic>);
+      }
+      final pj = j['patterns'] as List;
+      for (var i = 0; i < 16; i++) {
+        patterns[i].fromJson(pj[i] as Map<String, dynamic>);
+      }
       return true;
     } catch (_) {
       return false;
     }
+  }
+
+  Future<Slot> _slotFromJson(int i, Map<String, dynamic> j) async {
+    final factory = j['factory'] as String?;
+    final file = j['file'] as String?;
+    final drum = j['drum'] == true;
+    Slot s;
+    if (file != null) {
+      final f = File('${_dir!.path}/$file');
+      Float64List? data;
+      if (await f.exists()) data = decodeWav(await f.readAsBytes());
+      if (data == null) return emptySlot(i);
+      final sl = (j['slices'] as List?)?.map((e) => (e as num).toInt()).toList();
+      s = Slot(name: j['name'] as String? ?? 'MIC', drum: drum, data: data, slices: sl, file: file);
+    } else if (factory != null && factory.startsWith('kit:')) {
+      s = drumFromKit(int.parse(factory.substring(4)));
+      s.drum = drum;
+    } else if (factory != null && factory.startsWith('mel:')) {
+      final id = factory.substring(4);
+      if (kLibraryById[id] == null) return factorySlot(i);
+      s = melodicFromLibrary(id);
+      s.drum = drum;
+    } else {
+      return emptySlot(i);
+    }
+    s.applyParams(j);
+    return s;
   }
 
   @override

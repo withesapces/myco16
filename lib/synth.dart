@@ -698,27 +698,75 @@ final List<SoundDef> kLibrary = [
 
 final Map<String, SoundDef> kLibraryById = {for (final d in kLibrary) d.id: d};
 
-class Kit {
+/// Kit batterie : 16 sons concaténés en un seul échantillon découpé en tranches.
+class DrumKit {
   final String name;
-  final List<String> pads; // 16 ids : 1-8 mélodique, 9-16 batterie
-  const Kit(this.name, this.pads);
+  final List<String> hits; // 16 ids de kLibrary
+  const DrumKit(this.name, this.hits);
 }
 
-const List<Kit> kKits = [
-  Kit('PSY', [
-    'sub', 'acid', 'bell', 'stab', 'lead', 'laser', 'blip', 'riser', //
-    'k_psy', 'sn', 'clap', 'ch', 'oh', 'tom', 'rim', 'zap',
+const List<DrumKit> kDrumKits = [
+  DrumKit('PSY', [
+    'k_psy', 'k_psy', 'sn', 'clap', 'ch', 'ch', 'oh', 'oh', //
+    'tom', 'tomhi', 'rim', 'zap', 'shaker', 'tick', 'snap', 'k_top',
   ]),
-  Kit('TECHNO', [
-    'reese', 'bounce', 'stab', 'drone', 'impact', 'riser', 'down', 'vox', //
-    'k_909', 'k_rumble', 'clap', 'ch808', 'oh808', 'ride', 'rim', 'cowbell',
+  DrumKit('TECHNO', [
+    'k_909', 'k_rumble', 'sn909', 'clap', 'ch808', 'ch808', 'oh808', 'ride', //
+    'rim', 'cowbell', 'tom', 'tomhi', 'clapbig', 'shaker', 'metal', 'impact',
   ]),
-  Kit('HARD', [
-    'fmbass', 'reese', 'stab', 'laser', 'impact', 'down', 'vox', 'zap', //
-    'k_hard', 'k_gabber', 'k_top', 'clapbig', 'ch', 'oh', 'metal', 'snap',
+  DrumKit('HARD', [
+    'k_hard', 'k_gabber', 'k_top', 'clapbig', 'ch', 'oh', 'metal', 'snap', //
+    'sn909', 'rim', 'zap', 'impact', 'k_boom', 'ch808', 'oh808', 'down',
   ]),
-  Kit('FOREST', [
-    'roll', 'pluck', 'bell', 'vox', 'drone', 'bird', 'drop', 'whoop', //
-    'k_forest', 'k_dark', 'conga', 'wood', 'shaker', 'ch', 'tick', 'snap',
+  DrumKit('FOREST', [
+    'k_forest', 'k_dark', 'conga', 'wood', 'shaker', 'ch', 'tick', 'snap', //
+    'tom', 'tomhi', 'rim', 'bird', 'drop', 'whoop', 'clap', 'oh',
+  ]),
+  DrumKit('808', [
+    'k_808', 'k_boom', 'sn', 'clap', 'ch808', 'oh808', 'cowbell', 'rim', //
+    'tom', 'tomhi', 'conga', 'shaker', 'snap', 'wood', 'ride', 'zap',
+  ]),
+  DrumKit('KICKS', [
+    'k_psy', 'k_909', 'k_808', 'k_hard', 'k_gabber', 'k_rumble', 'k_forest', 'k_dark', //
+    'k_dub', 'k_tribal', 'k_top', 'k_boom', 'k_psy', 'k_909', 'k_hard', 'k_forest',
+  ]),
+  DrumKit('PERCU', [
+    'conga', 'wood', 'cowbell', 'tick', 'metal', 'tom', 'tomhi', 'rim', //
+    'snap', 'shaker', 'zap', 'clap', 'ch', 'oh', 'ride', 'k_tribal',
+  ]),
+  DrumKit('FX', [
+    'laser', 'blip', 'riser', 'down', 'impact', 'whoop', 'bird', 'drop', //
+    'zap', 'metal', 'tick', 'vox', 'stab', 'bell', 'pluck', 'lead',
   ]),
 ];
+
+/// Sons mélodiques d'usine des slots 1 à 8.
+const List<String> kMelodicDefaults = [
+  'sub', 'roll', 'acid', 'reese', 'bell', 'stab', 'pluck', 'vox',
+];
+
+/// Construit l'échantillon d'un kit : chaque coup est tronqué à 0,6 s max.
+({Float64List data, List<int> slices}) buildDrumKit(DrumKit kit) {
+  final parts = <Float64List>[];
+  final cache = <String, Float64List>{};
+  for (final id in kit.hits) {
+    final full = cache[id] ??= kLibraryById[id]!.gen();
+    final n = min(full.length, (0.6 * kSr).round());
+    final part = Float64List.fromList(full.sublist(0, n));
+    final fade = min(n, (0.01 * kSr).round());
+    for (var i = 0; i < fade; i++) {
+      part[n - 1 - i] *= i / fade;
+    }
+    parts.add(part);
+  }
+  final total = parts.fold<int>(0, (a, p) => a + p.length);
+  final data = Float64List(total);
+  final slices = <int>[];
+  var o = 0;
+  for (final p in parts) {
+    slices.add(o);
+    data.setRange(o, o + p.length, p);
+    o += p.length;
+  }
+  return (data: data, slices: slices);
+}

@@ -1,4 +1,4 @@
-// Page d'arrangement : enchaîner les patterns pour construire un morceau.
+// Arrangement : la chaîne de patterns (jusqu'à 128 blocs).
 import 'package:flutter/material.dart';
 
 import 'engine.dart';
@@ -35,16 +35,13 @@ class SongPage extends StatelessWidget {
                   child: Container(
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: e.song[index] == i ? cPadOn : cPad,
+                      color: e.chain[index] == i ? cPadOn : cPad,
                       borderRadius: BorderRadius.circular(8),
                     ),
-                    child: Text(
-                      '${i + 1}${e.patternUsed(i) ? '•' : ''}',
-                      style: TextStyle(
-                        color: e.song[index] == i ? cLcdInk : cText,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
+                    child: Text('${i + 1}${e.patterns[i].used ? '•' : ''}',
+                        style: TextStyle(
+                            color: e.chain[index] == i ? cLcdInk : cText,
+                            fontWeight: FontWeight.w800)),
                   ),
                 ),
             ],
@@ -52,7 +49,7 @@ class SongPage extends StatelessWidget {
         ),
       ),
     );
-    if (p != null) e.songSet(index, p);
+    if (p != null) e.chainSet(index, p);
   }
 
   @override
@@ -67,26 +64,8 @@ class SongPage extends StatelessWidget {
               style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 3)),
           actions: [
             IconButton(
-              tooltip: 'Tout effacer',
-              onPressed: e.song.isEmpty
-                  ? null
-                  : () async {
-                      final ok = await showDialog<bool>(
-                        context: context,
-                        builder: (ctx) => AlertDialog(
-                          title: const Text('Effacer tout l\'arrangement ?'),
-                          actions: [
-                            TextButton(
-                                onPressed: () => Navigator.pop(ctx, false),
-                                child: const Text('Annuler')),
-                            TextButton(
-                                onPressed: () => Navigator.pop(ctx, true),
-                                child: const Text('Effacer')),
-                          ],
-                        ),
-                      );
-                      if (ok == true) e.songClear();
-                    },
+              tooltip: 'Revenir à un seul pattern',
+              onPressed: e.chain.length <= 1 ? null : e.chainReset,
               icon: const Icon(Icons.delete_sweep_outlined),
             ),
           ],
@@ -98,129 +77,105 @@ class SongPage extends StatelessWidget {
           child: Icon(e.playing ? Icons.stop : Icons.play_arrow),
         ),
         body: Column(children: [
-          SwitchListTile(
-            value: e.songMode,
-            onChanged: e.setSongMode,
-            activeThumbColor: cSong,
-            title: const Text('Jouer l\'arrangement'),
-            subtitle: Text(
-              e.songMode
-                  ? '${e.song.length} blocs · ${_dur(e.songSeconds)} à ${e.bpm} BPM, en boucle'
-                  : 'Désactivé : le pattern courant tourne en boucle',
-              style: const TextStyle(color: cDim),
+          ListTile(
+            title: Text('${e.chain.length} bloc${e.chain.length > 1 ? 's' : ''} · ${_dur(e.chainSeconds)} à ${e.bpm} BPM'),
+            subtitle: const Text(
+              'Raccourci sur l\'appareil : PATTERN + plusieurs touches à la suite.',
+              style: TextStyle(color: cDim),
             ),
           ),
           const Divider(height: 1),
           Expanded(
-            child: e.song.isEmpty
-                ? const Center(
-                    child: Padding(
-                      padding: EdgeInsets.all(32),
-                      child: Text(
-                        'Ajoute des patterns avec les boutons du bas.\n'
-                        'Chaque bloc dure une mesure (16 pas).\n'
-                        'Glisse la poignée pour réordonner, touche un bloc pour changer son pattern.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: cDim, height: 1.5),
-                      ),
+            child: ReorderableListView.builder(
+              padding: const EdgeInsets.only(bottom: 90),
+              itemCount: e.chain.length,
+              onReorder: e.chainMove,
+              itemBuilder: (context, i) {
+                final live = e.playing && e.chainIndex == i && e.chain.length > 1;
+                return Container(
+                  key: ValueKey('blk_$i'),
+                  color: live ? cSong.withValues(alpha: 0.18) : null,
+                  child: ListTile(
+                    onTap: () => _pickPattern(context, i),
+                    leading: SizedBox(
+                      width: 34,
+                      child: Text('${i + 1}',
+                          style: const TextStyle(color: cDim, fontFamily: 'monospace')),
                     ),
-                  )
-                : ReorderableListView.builder(
-                    padding: const EdgeInsets.only(bottom: 90),
-                    itemCount: e.song.length,
-                    onReorder: e.songMove,
-                    itemBuilder: (context, i) {
-                      final live = e.playing && e.songMode && e.songIndex == i;
-                      return Container(
-                        key: ValueKey('blk_$i'),
-                        color: live ? cSong.withValues(alpha: 0.18) : null,
-                        child: ListTile(
-                          onTap: () => _pickPattern(context, i),
-                          leading: SizedBox(
-                            width: 34,
-                            child: Text('${i + 1}',
-                                style: const TextStyle(color: cDim, fontFamily: 'monospace')),
-                          ),
-                          title: Text(
-                            'PATTERN ${(e.song[i] + 1).toString().padLeft(2, '0')}',
-                            style: TextStyle(
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: 1,
-                              color: live ? cSong : cText,
-                            ),
-                          ),
-                          subtitle: e.patternUsed(e.song[i])
-                              ? null
-                              : const Text('vide', style: TextStyle(color: cDim)),
-                          trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                            IconButton(
-                              tooltip: 'Dupliquer',
-                              icon: const Icon(Icons.copy, size: 20),
-                              onPressed: () {
-                                e.songAdd(e.song[i]);
-                                e.songMove(e.song.length - 1, i + 1);
+                    title: Text('PATTERN ${(e.chain[i] + 1).toString().padLeft(2, '0')}',
+                        style: TextStyle(
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 1,
+                            color: live ? cSong : cText)),
+                    subtitle: e.patterns[e.chain[i]].used
+                        ? null
+                        : const Text('vide', style: TextStyle(color: cDim)),
+                    trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                      IconButton(
+                        tooltip: 'Dupliquer',
+                        icon: const Icon(Icons.copy, size: 20),
+                        onPressed: e.chain.length >= 128
+                            ? null
+                            : () {
+                                e.chainAdd(e.chain[i]);
+                                e.chainMove(e.chain.length - 1, i + 1);
                               },
-                            ),
-                            IconButton(
-                              tooltip: 'Supprimer',
-                              icon: const Icon(Icons.close, size: 20),
-                              onPressed: () => e.songRemoveAt(i),
-                            ),
-                            ReorderableDragStartListener(
-                              index: i,
-                              child: const Padding(
-                                padding: EdgeInsets.all(8),
-                                child: Icon(Icons.drag_handle),
-                              ),
-                            ),
-                          ]),
+                      ),
+                      IconButton(
+                        tooltip: 'Supprimer',
+                        icon: const Icon(Icons.close, size: 20),
+                        onPressed: e.chain.length <= 1 ? null : () => e.chainRemoveAt(i),
+                      ),
+                      ReorderableDragStartListener(
+                        index: i,
+                        child: const Padding(
+                          padding: EdgeInsets.all(8),
+                          child: Icon(Icons.drag_handle),
                         ),
-                      );
-                    },
+                      ),
+                    ]),
                   ),
+                );
+              },
+            ),
           ),
           Container(
             color: cBody,
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 16),
             child: SafeArea(
               top: false,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('AJOUTER UN BLOC',
-                      style: TextStyle(color: cDim, fontSize: 11, letterSpacing: 1)),
-                  const SizedBox(height: 8),
-                  GridView.count(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    crossAxisCount: 8,
-                    mainAxisSpacing: 6,
-                    crossAxisSpacing: 6,
-                    childAspectRatio: 1.2,
-                    children: [
-                      for (var p = 0; p < 16; p++)
-                        InkWell(
-                          onTap: () => e.songAdd(p),
-                          child: Container(
-                            alignment: Alignment.center,
-                            decoration: BoxDecoration(
-                              color: e.patternUsed(p) ? cPcb : cPad,
-                              borderRadius: BorderRadius.circular(6),
-                              border: Border.all(
-                                color: e.patternUsed(p)
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text('AJOUTER UN BLOC',
+                    style: TextStyle(color: cDim, fontSize: 11, letterSpacing: 1)),
+                const SizedBox(height: 8),
+                GridView.count(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  crossAxisCount: 8,
+                  mainAxisSpacing: 6,
+                  crossAxisSpacing: 6,
+                  childAspectRatio: 1.2,
+                  children: [
+                    for (var p = 0; p < 16; p++)
+                      InkWell(
+                        onTap: () => e.chainAdd(p),
+                        child: Container(
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: e.patterns[p].used ? cPcb : cPad,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(
+                                color: e.patterns[p].used
                                     ? cPadOn.withValues(alpha: 0.6)
-                                    : Colors.transparent,
-                              ),
-                            ),
-                            child: Text('${p + 1}',
-                                style: const TextStyle(
-                                    color: cText, fontWeight: FontWeight.w800)),
+                                    : Colors.transparent),
                           ),
+                          child: Text('${p + 1}',
+                              style: const TextStyle(color: cText, fontWeight: FontWeight.w800)),
                         ),
-                    ],
-                  ),
-                ],
-              ),
+                      ),
+                  ],
+                ),
+              ]),
             ),
           ),
         ]),

@@ -1,10 +1,11 @@
-// MYCO-16 : sampler de poche, 16 pads, 16 pas, 16 FX, arrangement.
-import 'dart:async';
+// MYCO-16 : micro-sampler de poche.
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'engine.dart';
+import 'lcd.dart';
 import 'song_page.dart';
 import 'sound_sheet.dart';
 import 'theme.dart';
@@ -37,8 +38,6 @@ class DevicePage extends StatefulWidget {
 
 class _DevicePageState extends State<DevicePage> {
   final Engine e = Engine();
-  final List<Timer?> _longPress = List<Timer?>.filled(16, null);
-  final List<bool> _longFired = List<bool>.filled(16, false);
 
   @override
   void initState() {
@@ -58,102 +57,105 @@ class _DevicePageState extends State<DevicePage> {
     super.dispose();
   }
 
-  void _toast(String msg) {
+  void _toast(String? msg) {
+    if (msg == null || !mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(msg), duration: const Duration(seconds: 2)));
   }
 
-  // ── pads ───────────────────────────────────
-  void _padDown(int i) {
-    HapticFeedback.lightImpact();
-    _longFired[i] = false;
-    _longPress[i]?.cancel();
-    if (e.mode == Mode.sound || e.mode == Mode.pattern) {
-      _longPress[i] = Timer(const Duration(milliseconds: 450), () {
-        _longFired[i] = true;
-        HapticFeedback.mediumImpact();
-        if (e.mode == Mode.sound) _openSoundSheet(i);
-        if (e.mode == Mode.pattern) _patternMenu(i);
-      });
-    }
-    switch (e.mode) {
-      case Mode.sound:
-        e.padPlay(i);
-        break;
-      case Mode.write:
-        e.toggleStep(i);
-        break;
-      case Mode.pattern:
-        break; // sélection au relâchement (pour laisser place à l'appui long)
-      case Mode.fx:
-        e.fxDown(i);
-        break;
-      case Mode.rec:
-        e.recStart(i).then((err) {
-          if (err != null) _toast(err);
-        });
-        break;
-    }
+  // ── touches 1-16 ──
+  bool _keyLit(int k) {
+    final h = e.held;
+    if (e.recordingSlot == k) return true;
+    if (h.contains(Btn.record)) return false;
+    if (h.contains(Btn.sound)) return k == e.sound;
+    if (h.contains(Btn.pattern)) return k == e.pattern;
+    if (h.contains(Btn.bpm)) return k < e.masterVol;
+    if (h.contains(Btn.fx)) return k == e.liveFx;
+    if (e.writeMode) return e.patterns[e.pattern].tracks[e.sound][k] != null;
+    return DateTime.now().millisecondsSinceEpoch - e.keyFlash[k] < 110;
   }
 
-  void _padUp(int i) {
-    _longPress[i]?.cancel();
-    if (e.mode == Mode.pattern && !_longFired[i]) e.selectPattern(i);
-    if (e.mode == Mode.fx) e.fxUp(i);
-    if (e.mode == Mode.rec && e.recordingSlot == i) {
-      e.recStop().then((msg) {
-        if (msg != null) _toast(msg);
-      });
+  String _keyLabel(int k) {
+    final h = e.held;
+    if (h.contains(Btn.record)) return e.slots[k].isEmpty ? 'REC' : e.slots[k].name;
+    if (h.contains(Btn.sound)) return e.slots[k].name;
+    if (h.contains(Btn.pattern)) {
+      final inChain = e.chain.length > 1 && e.chain.contains(k);
+      return 'PAT${e.patterns[k].used ? ' •' : ''}${inChain ? ' ♪' : ''}';
     }
+    if (h.contains(Btn.bpm)) return 'VOL ${k + 1}';
+    if (h.contains(Btn.fx)) return kFxShort[k];
+    if (e.writeMode) return '';
+    return '';
   }
 
-  void _openSoundSheet(int pad) {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: cBody,
-      builder: (_) => SoundSheet(engine: e, pad: pad),
-    );
+  Color _keyColor(int k) {
+    final h = e.held;
+    if (e.recordingSlot == k || h.contains(Btn.record)) return cRec;
+    if (h.contains(Btn.fx)) return const Color(0xFFB98CFF);
+    if (h.contains(Btn.pattern) || h.contains(Btn.sound)) return cSong;
+    return cPadOn;
   }
 
-  void _patternMenu(int p) {
-    final cur = e.pattern;
+  // ── menu ──
+  void _menu() {
     showModalBottomSheet(
       context: context,
       backgroundColor: cBody,
       builder: (ctx) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           ListTile(
-            title: Text('PATTERN ${p + 1}',
-                style: const TextStyle(fontWeight: FontWeight.w800, letterSpacing: 2)),
-          ),
-          if (p != cur)
-            ListTile(
-              leading: const Icon(Icons.copy),
-              title: Text('Copier le pattern ${cur + 1} ici'),
-              onTap: () {
-                e.copyPattern(cur, p);
-                Navigator.pop(ctx);
-                _toast('Pattern ${cur + 1} copié dans ${p + 1}');
-              },
-            ),
-          ListTile(
-            leading: const Icon(Icons.delete_outline),
-            title: Text('Effacer le pattern ${p + 1}'),
+            leading: const Icon(Icons.queue_music),
+            title: const Text('Arrangement (chaîne de patterns)'),
             onTap: () {
-              e.clearPattern(p);
               Navigator.pop(ctx);
-              _toast('Pattern ${p + 1} effacé');
+              Navigator.of(context)
+                  .push(MaterialPageRoute(builder: (_) => SongPage(engine: e)));
             },
           ),
           ListTile(
-            leading: const Icon(Icons.playlist_add),
-            title: Text('Ajouter le pattern ${p + 1} à l\'arrangement'),
+            leading: const Icon(Icons.library_music),
+            title: Text('Bibliothèque : charger un son dans le slot ${e.sound + 1}'),
             onTap: () {
-              e.songAdd(p);
               Navigator.pop(ctx);
-              _toast('Ajouté (bloc ${e.song.length})');
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                backgroundColor: cBody,
+                builder: (_) => SoundSheet(engine: e),
+              );
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.help_outline),
+            title: const Text('Aide : toutes les combinaisons'),
+            onTap: () {
+              Navigator.pop(ctx);
+              _help();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.restore),
+            title: const Text('Remettre les 16 sons d\'usine'),
+            onTap: () async {
+              Navigator.pop(ctx);
+              if (await _confirm('Remplacer les 16 sons par ceux d\'usine ?')) {
+                await e.resetFactory();
+                _toast('Sons d\'usine rechargés');
+              }
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.delete_forever_outlined),
+            title: const Text('Effacer tous les patterns'),
+            onTap: () async {
+              Navigator.pop(ctx);
+              if (await _confirm('Effacer les 16 patterns et la chaîne ?')) {
+                e.clearAllPatterns();
+                _toast('Patterns effacés');
+              }
             },
           ),
         ]),
@@ -161,47 +163,18 @@ class _DevicePageState extends State<DevicePage> {
     );
   }
 
-  void _openBpm() {
-    showModalBottomSheet(
+  Future<bool> _confirm(String q) async {
+    final r = await showDialog<bool>(
       context: context,
-      backgroundColor: cBody,
-      builder: (_) => BpmSheet(engine: e),
+      builder: (ctx) => AlertDialog(
+        title: Text(q),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Annuler')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('OK')),
+        ],
+      ),
     );
-  }
-
-  void _openSong() {
-    Navigator.of(context).push(MaterialPageRoute(builder: (_) => SongPage(engine: e)));
-  }
-
-  bool _padLit(int i) {
-    switch (e.mode) {
-      case Mode.sound:
-        return i == e.selected ||
-            DateTime.now().millisecondsSinceEpoch - e.flash[i] < 90;
-      case Mode.write:
-        return e.patterns[e.pattern][e.selected][i];
-      case Mode.pattern:
-        return i == e.pattern;
-      case Mode.fx:
-        return e.fx == i;
-      case Mode.rec:
-        return e.recordingSlot == i;
-    }
-  }
-
-  String _padLabel(int i) {
-    switch (e.mode) {
-      case Mode.fx:
-        return kFxNames[i];
-      case Mode.pattern:
-        final inSong = e.song.contains(i);
-        return '${e.patternUsed(i) ? 'PAT •' : 'PAT'}${inSong ? ' ♪' : ''}';
-      case Mode.write:
-        return '';
-      case Mode.sound:
-      case Mode.rec:
-        return e.padName(i);
-    }
+    return r == true;
   }
 
   @override
@@ -212,27 +185,42 @@ class _DevicePageState extends State<DevicePage> {
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 460),
             child: Padding(
-              padding: const EdgeInsets.all(14),
+              padding: const EdgeInsets.all(12),
               child: Container(
                 decoration: BoxDecoration(
                   color: cBody,
                   borderRadius: BorderRadius.circular(18),
                   border: Border.all(color: cPcb, width: 2),
                 ),
-                padding: const EdgeInsets.fromLTRB(14, 14, 14, 18),
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 14),
                 child: !e.ready
-                    ? _loading()
-                    : Column(
-                        children: [
-                          _header(),
-                          const SizedBox(height: 10),
-                          _lcd(),
-                          const SizedBox(height: 14),
-                          _controls(),
-                          const SizedBox(height: 14),
-                          Expanded(child: _grid()),
-                        ],
-                      ),
+                    ? Center(
+                        child: Text(e.error ?? 'préparation des sons…',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(color: cText, fontFamily: 'monospace')),
+                      )
+                    : Column(children: [
+                        _header(),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          height: 150,
+                          child: Row(children: [
+                            Expanded(child: LcdScreen(engine: e)),
+                            const SizedBox(width: 10),
+                            Column(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                KnobWidget(engine: e, knob: Knob.a),
+                                KnobWidget(engine: e, knob: Knob.b),
+                              ],
+                            ),
+                          ]),
+                        ),
+                        const SizedBox(height: 12),
+                        _functionRows(),
+                        const SizedBox(height: 12),
+                        Expanded(child: _grid()),
+                      ]),
               ),
             ),
           ),
@@ -241,151 +229,59 @@ class _DevicePageState extends State<DevicePage> {
     );
   }
 
-  Widget _loading() => Center(
-        child: Text(
-          e.error ?? 'chargement des sons…',
-          textAlign: TextAlign.center,
-          style: const TextStyle(color: cText, fontFamily: 'monospace'),
+  Widget _header() => Row(children: [
+        const Text('MYCO-16',
+            style: TextStyle(
+                color: cText, fontWeight: FontWeight.w900, letterSpacing: 3, fontSize: 17)),
+        const SizedBox(width: 8),
+        Text('slot ${e.sound + 1} · ${e.cur.name}',
+            style: const TextStyle(color: cDim, fontSize: 11)),
+        const Spacer(),
+        GestureDetector(
+          onTap: _menu,
+          child: const Padding(
+            padding: EdgeInsets.all(4),
+            child: Icon(Icons.menu, color: cDim, size: 22),
+          ),
         ),
-      );
+      ]);
 
-  Widget _header() => Row(
-        children: [
-          const Text('MYCO-16',
-              style: TextStyle(
-                  color: cText,
-                  fontWeight: FontWeight.w900,
-                  letterSpacing: 3,
-                  fontSize: 18)),
-          const SizedBox(width: 8),
-          const Text('pocket sampler',
-              style: TextStyle(color: cDim, fontSize: 11, letterSpacing: 1)),
-          const Spacer(),
-          GestureDetector(
-            onTap: _help,
-            child: const Icon(Icons.help_outline, color: cDim, size: 20),
-          ),
-        ],
-      );
-
-  Widget _lcd() {
-    final String modeName;
-    if (e.processing) {
-      modeName = 'NETTOYAGE…';
-    } else {
-      modeName = {
-        Mode.sound: 'SOUND',
-        Mode.write: 'WRITE',
-        Mode.pattern: 'PATTERN',
-        Mode.fx: 'FX',
-        Mode.rec: e.recordingSlot != null ? '● REC' : 'REC ARM',
-      }[e.mode]!;
-    }
-    const ink = TextStyle(color: cLcdInk, fontFamily: 'monospace', fontSize: 13);
-    final songTxt = e.songMode && e.song.isNotEmpty
-        ? 'SONG ${(e.songIndex + 1).toString().padLeft(2, '0')}/${e.song.length.toString().padLeft(2, '0')}'
-        : 'LOOP';
-    return Container(
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(color: cLcd, borderRadius: BorderRadius.circular(6)),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(children: [
-            Text(modeName, style: ink.copyWith(fontSize: 20, fontWeight: FontWeight.bold)),
-            const Spacer(),
-            Text(songTxt, style: ink),
-            const SizedBox(width: 8),
-            Text(e.playing ? '▶' : '■', style: ink.copyWith(fontSize: 18)),
-          ]),
-          const SizedBox(height: 4),
-          Text(
-            'BPM ${e.bpm}  PAT ${(e.pattern + 1).toString().padLeft(2, '0')}  '
-            'SND ${(e.selected + 1).toString().padLeft(2, '0')} ${e.padName(e.selected)}',
-            style: ink,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: List.generate(16, (i) {
-              final on = e.patterns[e.pattern][e.selected][i];
-              final head = e.step == i;
-              return Expanded(
-                child: Container(
-                  height: 8,
-                  margin: const EdgeInsets.symmetric(horizontal: 1.5),
-                  decoration: BoxDecoration(
-                    color: head
-                        ? cLcdInk
-                        : (on
-                            ? cLcdInk.withValues(alpha: 0.45)
-                            : cLcdInk.withValues(alpha: 0.1)),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              );
-            }),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _controls() {
-    Widget b(String label, VoidCallback onTap,
-        {bool active = false, Color? activeColor, VoidCallback? onLong}) {
-      return Expanded(
-        child: Padding(
-          padding: const EdgeInsets.all(3),
-          child: GestureDetector(
-            onTap: () {
-              HapticFeedback.selectionClick();
-              onTap();
-            },
-            onLongPress: onLong,
-            child: Container(
-              height: 40,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: active ? (activeColor ?? cPadOn) : cPcb,
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Text(label,
-                  style: TextStyle(
-                      color: active ? cLcdInk : cText,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 1)),
+  Widget _functionRows() {
+    Widget fb(Btn b, String label, {bool lit = false, Color? litColor}) => Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(3),
+            child: FuncButton(
+              label: label,
+              pressed: e.held.contains(b),
+              lit: lit,
+              litColor: litColor ?? cPadOn,
+              onDown: () {
+                HapticFeedback.selectionClick();
+                e.btnDown(b);
+              },
+              onUp: () => e.btnUp(b),
             ),
           ),
-        ),
-      );
-    }
-
+        );
     return Column(children: [
       Row(children: [
-        b('SOUND', () => e.setMode(Mode.sound), active: e.mode == Mode.sound),
-        b('PATTERN', () => e.setMode(Mode.pattern), active: e.mode == Mode.pattern),
-        b('SONG', _openSong, active: e.songMode, activeColor: const Color(0xFF9AD1FF)),
-        b('${e.bpm}', _openBpm),
+        fb(Btn.sound, 'SOUND'),
+        fb(Btn.pattern, 'PATTERN', lit: e.chaining, litColor: cSong),
+        fb(Btn.bpm, 'BPM'),
+        fb(Btn.fx, 'FX', lit: e.liveFx != null, litColor: const Color(0xFFB98CFF)),
       ]),
       Row(children: [
-        b('WRITE', () => e.setMode(Mode.write), active: e.mode == Mode.write, onLong: () {
-          e.clearTrack();
-          _toast('Piste ${e.padName(e.selected)} effacée');
-        }),
-        b('FX', () => e.setMode(Mode.fx), active: e.mode == Mode.fx),
-        b('REC', () => e.setMode(Mode.rec), active: e.mode == Mode.rec, activeColor: cRec),
-        b(e.playing ? 'STOP' : 'PLAY', e.togglePlay,
-            active: e.playing, activeColor: const Color(0xFF7BD389)),
+        fb(Btn.record, 'RECORD', lit: e.recordingSlot != null, litColor: cRec),
+        fb(Btn.write, 'WRITE', lit: e.writeMode),
+        fb(Btn.play, e.playing ? 'STOP' : 'PLAY',
+            lit: e.playing, litColor: const Color(0xFF7BD389)),
       ]),
     ]);
   }
 
   Widget _grid() {
     return LayoutBuilder(builder: (context, c) {
-      final size = c.maxWidth < c.maxHeight ? c.maxWidth : c.maxHeight;
+      final size = min(c.maxWidth, c.maxHeight);
       return Center(
         child: SizedBox(
           width: size,
@@ -393,59 +289,65 @@ class _DevicePageState extends State<DevicePage> {
           child: GridView.count(
             crossAxisCount: 4,
             physics: const NeverScrollableScrollPhysics(),
-            mainAxisSpacing: 10,
-            crossAxisSpacing: 10,
-            children: List.generate(16, (i) => _pad(i)),
+            mainAxisSpacing: 9,
+            crossAxisSpacing: 9,
+            children: List.generate(16, _key),
           ),
         ),
       );
     });
   }
 
-  Widget _pad(int i) {
-    final lit = _padLit(i);
-    final head = e.playing && e.step == i;
-    final rec = e.mode == Mode.rec;
-    final onColor = rec ? cRec : cPadOn;
+  Widget _key(int k) {
+    final lit = _keyLit(k);
+    final color = _keyColor(k);
+    final head = e.playing && e.step == k;
+    final label = _keyLabel(k);
     return Listener(
-      onPointerDown: (_) => _padDown(i),
-      onPointerUp: (_) => _padUp(i),
-      onPointerCancel: (_) => _padUp(i),
+      onPointerDown: (_) {
+        HapticFeedback.lightImpact();
+        e.keyDown(k).then(_toast);
+      },
+      onPointerUp: (_) => e.keyUp(k).then(_toast),
+      onPointerCancel: (_) => e.keyUp(k).then(_toast),
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 60),
+        duration: const Duration(milliseconds: 50),
         decoration: BoxDecoration(
-          color: lit ? onColor : cPad,
+          color: lit ? color : cPad,
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: head ? cText : Colors.transparent, width: 2),
-          boxShadow: lit
-              ? [BoxShadow(color: onColor.withValues(alpha: 0.55), blurRadius: 14)]
-              : const [],
+          boxShadow: lit ? [BoxShadow(color: color.withValues(alpha: 0.5), blurRadius: 12)] : const [],
         ),
-        padding: const EdgeInsets.all(7),
+        padding: const EdgeInsets.all(6),
         child: Stack(children: [
           Align(
             alignment: Alignment.topLeft,
-            child: Text('${i + 1}',
+            child: Text('${k + 1}',
                 style: TextStyle(
-                    color: lit ? cLcdInk : cDim, fontSize: 11, fontWeight: FontWeight.w700)),
+                    color: lit ? cLcdInk : cDim, fontSize: 12, fontWeight: FontWeight.w800)),
           ),
-          if (e.padIsMic(i) && (e.mode == Mode.sound || rec))
-            const Align(
+          if (k == 7 && !e.cur.drum && e.held.isEmpty && !e.writeMode)
+            Align(
               alignment: Alignment.topRight,
-              child: Icon(Icons.mic, size: 12, color: cText),
+              child: Container(
+                width: 5,
+                height: 5,
+                decoration: BoxDecoration(
+                    color: lit ? cLcdInk : cDim, shape: BoxShape.circle),
+              ),
             ),
-          Align(
-            alignment: Alignment.bottomLeft,
-            child: Text(_padLabel(i),
-                maxLines: 1,
-                overflow: TextOverflow.fade,
-                softWrap: false,
-                style: TextStyle(
-                    color: lit ? cLcdInk : cText,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.5)),
-          ),
+          if (label.isNotEmpty)
+            Align(
+              alignment: Alignment.bottomLeft,
+              child: Text(label,
+                  maxLines: 1,
+                  overflow: TextOverflow.fade,
+                  softWrap: false,
+                  style: TextStyle(
+                      color: lit ? cLcdInk : cText,
+                      fontSize: 9.5,
+                      fontWeight: FontWeight.w700)),
+            ),
         ]),
       ),
     );
@@ -456,96 +358,187 @@ class _DevicePageState extends State<DevicePage> {
       context: context,
       backgroundColor: cBody,
       isScrollControlled: true,
-      builder: (_) => const SafeArea(
-        child: SingleChildScrollView(
-          padding: EdgeInsets.all(20),
-          child: Text(
-            'SOUND : touche un pad pour le jouer. Appui long = choisir son son '
-            '(50 sons, 4 kits), l\'accorder et régler son volume.\n\n'
-            'WRITE : les pads deviennent les 16 pas du son choisi. '
-            'Appui long sur WRITE = efface la piste.\n\n'
-            'PATTERN : touche un pad pour choisir le pattern. Appui long = copier le '
-            'pattern courant ici, l\'effacer, ou l\'ajouter à l\'arrangement.\n\n'
-            'SONG : construis ton morceau en enchaînant les patterns, réordonne-les '
-            'et active la lecture de l\'arrangement.\n\n'
-            'FX : garde le doigt sur un pad pour appliquer l\'effet.\n\n'
-            'REC : garde le doigt sur un pad et fais du bruit, relâche. Le souffle '
-            'du micro est nettoyé automatiquement (6 s max). Laisse une demi-seconde '
-            'de silence avant le son pour un nettoyage optimal.\n\n'
-            'Tout est sauvegardé automatiquement.',
-            style: TextStyle(color: cText, height: 1.5),
-          ),
+      builder: (_) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.85,
+        builder: (context, scroll) => ListView(
+          controller: scroll,
+          padding: const EdgeInsets.all(20),
+          children: const [
+            _HelpSection('SONS', [
+              'Touches 1-16 : jouer le son choisi. Slots 1-8 = mélodique (gamme mineure, touche 8 = hauteur d\'origine). Slots 9-16 = batterie (une tranche par touche).',
+              'SOUND + touche : choisir le son.',
+              'RECORD + touche (maintenus) : enregistrer au micro dans ce slot. Le souffle est nettoyé, les enregistrements batterie sont découpés automatiquement. Mémoire totale : 40 s.',
+              'RECORD + SOUND : supprimer le son courant.',
+              'WRITE + SOUND + touche : copier le son courant vers ce slot.',
+            ]),
+            _HelpSection('KNOBS A / B', [
+              'Toucher FX (sans touche) change le mode des knobs : TON (hauteur / volume), FLT (filtre passe-bas ↔ passe-haut / résonance), TRM (début / longueur du son ; en batterie, la dernière tranche jouée).',
+              'BPM + knob A : swing. BPM + knob B : tempo (60-240).',
+            ]),
+            _HelpSection('SÉQUENCEUR', [
+              'PLAY : lecture / stop.',
+              'WRITE (toucher) : mode écriture, les touches deviennent les 16 pas du son courant (avec la dernière note jouée).',
+              'WRITE maintenu + touches pendant la lecture : enregistrement live, quantifié.',
+              'WRITE maintenu + knobs pendant la lecture : verrouille hauteur, volume, filtre ou résonance sur le pas en cours.',
+              'BPM (toucher) : presets 80 / 120 / 140. BPM + touche : volume général 1-16.',
+            ]),
+            _HelpSection('PATTERNS', [
+              'PATTERN + touche : choisir le pattern (bascule à la fin de la mesure pendant la lecture).',
+              'PATTERN + plusieurs touches à la suite : chaîner les patterns (jusqu\'à 128, répétitions permises).',
+              'WRITE + PATTERN + touche : copier le pattern courant vers cette touche.',
+              'RECORD + PATTERN : effacer le pattern courant.',
+              'Menu ☰ > Arrangement : voir et réordonner la chaîne.',
+            ]),
+            _HelpSection('EFFETS (FX + touche maintenue)', [
+              '1 loop 16 · 2 loop 12 · 3 loop short · 4 loop shorter · 5 unison · 6 unison low · 7 octave up · 8 octave down · 9 stutter 4 · 10 stutter 3 · 11 scratch · 12 scratch fast · 13 6/8 · 14 retrigger · 15 reverse · 16 aucun.',
+              'En mode écriture pendant la lecture, l\'effet est enregistré sur les pas qui défilent. FX + 16 en mode écriture efface les effets du pattern.',
+            ]),
+            _HelpSection('ÉCRAN', [
+              'Myco danse sur le tempo, s\'écrase sur les kicks, tend son micro quand tu enregistres, penche pendant les effets et s\'endort au bout de 20 s d\'inactivité (l\'écran affiche alors l\'heure).',
+              'Tout est sauvegardé automatiquement.',
+            ]),
+          ],
         ),
       ),
     );
   }
 }
 
-class BpmSheet extends StatefulWidget {
-  final Engine engine;
-  const BpmSheet({super.key, required this.engine});
+class _HelpSection extends StatelessWidget {
+  final String title;
+  final List<String> lines;
+  const _HelpSection(this.title, this.lines);
   @override
-  State<BpmSheet> createState() => _BpmSheetState();
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.only(bottom: 18),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(title,
+              style: const TextStyle(
+                  color: cPadOn, fontWeight: FontWeight.w900, letterSpacing: 2)),
+          const SizedBox(height: 6),
+          for (final l in lines)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Text('• $l', style: const TextStyle(color: cText, height: 1.4)),
+            ),
+        ]),
+      );
 }
 
-class _BpmSheetState extends State<BpmSheet> {
-  final List<int> _taps = [];
-
-  void _tap() {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (_taps.isNotEmpty && now - _taps.last > 2000) _taps.clear();
-    _taps.add(now);
-    if (_taps.length > 5) _taps.removeAt(0);
-    if (_taps.length >= 2) {
-      final avg = (_taps.last - _taps.first) / (_taps.length - 1);
-      widget.engine.setBpm((60000 / avg).round());
-    }
-    setState(() {});
-  }
+class FuncButton extends StatelessWidget {
+  final String label;
+  final bool pressed;
+  final bool lit;
+  final Color litColor;
+  final VoidCallback onDown;
+  final VoidCallback onUp;
+  const FuncButton({
+    super.key,
+    required this.label,
+    required this.pressed,
+    required this.lit,
+    required this.litColor,
+    required this.onDown,
+    required this.onUp,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final e = widget.engine;
-    return ListenableBuilder(
-      listenable: e,
-      builder: (context, _) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Text('${e.bpm} BPM',
-                style: const TextStyle(
-                    color: cText, fontSize: 28, fontWeight: FontWeight.w900)),
-            Slider(
-              value: e.bpm.toDouble(),
-              min: 60,
-              max: 200,
-              divisions: 140,
-              onChanged: (v) => e.setBpm(v.round()),
-            ),
-            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-              for (final d in [-5, -1, 1, 5])
-                Padding(
-                  padding: const EdgeInsets.all(4),
-                  child: OutlinedButton(
-                    onPressed: () => e.setBpm(e.bpm + d),
-                    child: Text(d > 0 ? '+$d' : '$d'),
-                  ),
-                ),
-            ]),
-            const SizedBox(height: 8),
-            Wrap(spacing: 8, children: [
-              for (final preset in [128, 138, 145, 150, 160])
-                ActionChip(label: Text('$preset'), onPressed: () => e.setBpm(preset)),
-            ]),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              height: 56,
-              child: FilledButton(onPressed: _tap, child: const Text('TAP TEMPO')),
-            ),
-          ]),
+    return Listener(
+      onPointerDown: (_) => onDown(),
+      onPointerUp: (_) => onUp(),
+      onPointerCancel: (_) => onUp(),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 60),
+        height: 42,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: pressed ? cText : (lit ? litColor : cPcb),
+          borderRadius: BorderRadius.circular(21),
         ),
+        child: Text(label,
+            style: TextStyle(
+                color: pressed || lit ? cLcdInk : cText,
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 1)),
       ),
     );
   }
+}
+
+class KnobWidget extends StatelessWidget {
+  final Engine engine;
+  final Knob knob;
+  const KnobWidget({super.key, required this.engine, required this.knob});
+
+  @override
+  Widget build(BuildContext context) {
+    final v = engine.knobValue(knob).clamp(0.0, 1.0).toDouble();
+    return GestureDetector(
+      onPanUpdate: (d) => engine.knobTurn(knob, (d.delta.dx - d.delta.dy) / 220),
+      onPanEnd: (_) => engine.knobRelease(),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        SizedBox(
+          width: 56,
+          height: 56,
+          child: CustomPaint(painter: _KnobPainter(v, knob == Knob.a ? 'A' : 'B')),
+        ),
+        Text(engine.knobLabel(knob),
+            style: const TextStyle(color: cDim, fontSize: 9, fontWeight: FontWeight.w700)),
+      ]),
+    );
+  }
+}
+
+class _KnobPainter extends CustomPainter {
+  final double v;
+  final String name;
+  _KnobPainter(this.v, this.name);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final r = size.width / 2 - 4;
+    const start = pi * 0.75, sweep = pi * 1.5;
+    canvas.drawCircle(c, r, Paint()..color = cPcb);
+    canvas.drawArc(
+        Rect.fromCircle(center: c, radius: r + 2),
+        start,
+        sweep,
+        false,
+        Paint()
+          ..color = cPad
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3);
+    canvas.drawArc(
+        Rect.fromCircle(center: c, radius: r + 2),
+        start,
+        sweep * v,
+        false,
+        Paint()
+          ..color = cPadOn
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3
+          ..strokeCap = StrokeCap.round);
+    final a = start + sweep * v;
+    canvas.drawLine(
+        c + Offset(cos(a), sin(a)) * r * 0.25,
+        c + Offset(cos(a), sin(a)) * r * 0.85,
+        Paint()
+          ..color = cText
+          ..strokeWidth = 3
+          ..strokeCap = StrokeCap.round);
+    final tp = TextPainter(
+      text: TextSpan(
+          text: name,
+          style: const TextStyle(color: cDim, fontSize: 10, fontWeight: FontWeight.w900)),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, c + Offset(-tp.width / 2, r * 0.35));
+  }
+
+  @override
+  bool shouldRepaint(covariant _KnobPainter old) => old.v != v || old.name != name;
 }
