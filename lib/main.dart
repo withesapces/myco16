@@ -1,19 +1,13 @@
-// MYCO-16 : sampler de poche, 16 pads, 16 pas, 16 FX.
+// MYCO-16 : sampler de poche, 16 pads, 16 pas, 16 FX, arrangement.
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'engine.dart';
-
-const cBg = Color(0xFF0E120E);
-const cBody = Color(0xFF1C2A1F); // mousse
-const cPcb = Color(0xFF243629);
-const cPad = Color(0xFF2E3B31);
-const cPadOn = Color(0xFFFF8A1F); // ambre
-const cRec = Color(0xFFE5383B);
-const cLcd = Color(0xFFB9C4A0);
-const cLcdInk = Color(0xFF1C2317);
-const cText = Color(0xFFE8EDE3);
-const cDim = Color(0xFF8A9A8C);
+import 'song_page.dart';
+import 'sound_sheet.dart';
+import 'theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,7 +21,10 @@ class MycoApp extends StatelessWidget {
   Widget build(BuildContext context) => MaterialApp(
         title: 'MYCO-16',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData.dark().copyWith(scaffoldBackgroundColor: cBg),
+        theme: ThemeData.dark().copyWith(
+          scaffoldBackgroundColor: cBg,
+          colorScheme: const ColorScheme.dark(primary: cPadOn, surface: cBody),
+        ),
         home: const DevicePage(),
       );
 }
@@ -40,6 +37,8 @@ class DevicePage extends StatefulWidget {
 
 class _DevicePageState extends State<DevicePage> {
   final Engine e = Engine();
+  final List<Timer?> _longPress = List<Timer?>.filled(16, null);
+  final List<bool> _longFired = List<bool>.filled(16, false);
 
   @override
   void initState() {
@@ -68,6 +67,16 @@ class _DevicePageState extends State<DevicePage> {
   // ── pads ───────────────────────────────────
   void _padDown(int i) {
     HapticFeedback.lightImpact();
+    _longFired[i] = false;
+    _longPress[i]?.cancel();
+    if (e.mode == Mode.sound || e.mode == Mode.pattern) {
+      _longPress[i] = Timer(const Duration(milliseconds: 450), () {
+        _longFired[i] = true;
+        HapticFeedback.mediumImpact();
+        if (e.mode == Mode.sound) _openSoundSheet(i);
+        if (e.mode == Mode.pattern) _patternMenu(i);
+      });
+    }
     switch (e.mode) {
       case Mode.sound:
         e.padPlay(i);
@@ -76,8 +85,7 @@ class _DevicePageState extends State<DevicePage> {
         e.toggleStep(i);
         break;
       case Mode.pattern:
-        e.selectPattern(i);
-        break;
+        break; // sélection au relâchement (pour laisser place à l'appui long)
       case Mode.fx:
         e.fxDown(i);
         break;
@@ -90,8 +98,79 @@ class _DevicePageState extends State<DevicePage> {
   }
 
   void _padUp(int i) {
+    _longPress[i]?.cancel();
+    if (e.mode == Mode.pattern && !_longFired[i]) e.selectPattern(i);
     if (e.mode == Mode.fx) e.fxUp(i);
-    if (e.mode == Mode.rec && e.recordingSlot == i) e.recStop();
+    if (e.mode == Mode.rec && e.recordingSlot == i) {
+      e.recStop().then((msg) {
+        if (msg != null) _toast(msg);
+      });
+    }
+  }
+
+  void _openSoundSheet(int pad) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: cBody,
+      builder: (_) => SoundSheet(engine: e, pad: pad),
+    );
+  }
+
+  void _patternMenu(int p) {
+    final cur = e.pattern;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: cBody,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            title: Text('PATTERN ${p + 1}',
+                style: const TextStyle(fontWeight: FontWeight.w800, letterSpacing: 2)),
+          ),
+          if (p != cur)
+            ListTile(
+              leading: const Icon(Icons.copy),
+              title: Text('Copier le pattern ${cur + 1} ici'),
+              onTap: () {
+                e.copyPattern(cur, p);
+                Navigator.pop(ctx);
+                _toast('Pattern ${cur + 1} copié dans ${p + 1}');
+              },
+            ),
+          ListTile(
+            leading: const Icon(Icons.delete_outline),
+            title: Text('Effacer le pattern ${p + 1}'),
+            onTap: () {
+              e.clearPattern(p);
+              Navigator.pop(ctx);
+              _toast('Pattern ${p + 1} effacé');
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.playlist_add),
+            title: Text('Ajouter le pattern ${p + 1} à l\'arrangement'),
+            onTap: () {
+              e.songAdd(p);
+              Navigator.pop(ctx);
+              _toast('Ajouté (bloc ${e.song.length})');
+            },
+          ),
+        ]),
+      ),
+    );
+  }
+
+  void _openBpm() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: cBody,
+      builder: (_) => BpmSheet(engine: e),
+    );
+  }
+
+  void _openSong() {
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => SongPage(engine: e)));
   }
 
   bool _padLit(int i) {
@@ -115,12 +194,13 @@ class _DevicePageState extends State<DevicePage> {
       case Mode.fx:
         return kFxNames[i];
       case Mode.pattern:
-        return e.patternUsed(i) ? 'PAT •' : 'PAT';
+        final inSong = e.song.contains(i);
+        return '${e.patternUsed(i) ? 'PAT •' : 'PAT'}${inSong ? ' ♪' : ''}';
       case Mode.write:
         return '';
       case Mode.sound:
       case Mode.rec:
-        return e.names[i];
+        return e.padName(i);
     }
   }
 
@@ -189,34 +269,42 @@ class _DevicePageState extends State<DevicePage> {
       );
 
   Widget _lcd() {
-    final modeName = {
-      Mode.sound: 'SOUND',
-      Mode.write: 'WRITE',
-      Mode.pattern: 'PATTERN',
-      Mode.fx: 'FX',
-      Mode.rec: e.recordingSlot != null ? '● REC' : 'REC ARM',
-    }[e.mode]!;
+    final String modeName;
+    if (e.processing) {
+      modeName = 'NETTOYAGE…';
+    } else {
+      modeName = {
+        Mode.sound: 'SOUND',
+        Mode.write: 'WRITE',
+        Mode.pattern: 'PATTERN',
+        Mode.fx: 'FX',
+        Mode.rec: e.recordingSlot != null ? '● REC' : 'REC ARM',
+      }[e.mode]!;
+    }
     const ink = TextStyle(color: cLcdInk, fontFamily: 'monospace', fontSize: 13);
+    final songTxt = e.songMode && e.song.isNotEmpty
+        ? 'SONG ${(e.songIndex + 1).toString().padLeft(2, '0')}/${e.song.length.toString().padLeft(2, '0')}'
+        : 'LOOP';
     return Container(
       padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: cLcd,
-        borderRadius: BorderRadius.circular(6),
-      ),
+      decoration: BoxDecoration(color: cLcd, borderRadius: BorderRadius.circular(6)),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(children: [
-            Text(modeName,
-                style: ink.copyWith(fontSize: 20, fontWeight: FontWeight.bold)),
+            Text(modeName, style: ink.copyWith(fontSize: 20, fontWeight: FontWeight.bold)),
             const Spacer(),
+            Text(songTxt, style: ink),
+            const SizedBox(width: 8),
             Text(e.playing ? '▶' : '■', style: ink.copyWith(fontSize: 18)),
           ]),
           const SizedBox(height: 4),
           Text(
             'BPM ${e.bpm}  PAT ${(e.pattern + 1).toString().padLeft(2, '0')}  '
-            'SND ${(e.selected + 1).toString().padLeft(2, '0')} ${e.names[e.selected]}',
+            'SND ${(e.selected + 1).toString().padLeft(2, '0')} ${e.padName(e.selected)}',
             style: ink,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
           ),
           const SizedBox(height: 8),
           Row(
@@ -279,18 +367,16 @@ class _DevicePageState extends State<DevicePage> {
       Row(children: [
         b('SOUND', () => e.setMode(Mode.sound), active: e.mode == Mode.sound),
         b('PATTERN', () => e.setMode(Mode.pattern), active: e.mode == Mode.pattern),
-        b('BPM −', () => e.nudgeBpm(-2)),
-        b('BPM +', () => e.nudgeBpm(2)),
+        b('SONG', _openSong, active: e.songMode, activeColor: const Color(0xFF9AD1FF)),
+        b('${e.bpm}', _openBpm),
       ]),
       Row(children: [
-        b('WRITE', () => e.setMode(Mode.write), active: e.mode == Mode.write,
-            onLong: () {
+        b('WRITE', () => e.setMode(Mode.write), active: e.mode == Mode.write, onLong: () {
           e.clearTrack();
-          _toast('Piste ${e.names[e.selected]} effacée');
+          _toast('Piste ${e.padName(e.selected)} effacée');
         }),
         b('FX', () => e.setMode(Mode.fx), active: e.mode == Mode.fx),
-        b('REC', () => e.setMode(Mode.rec),
-            active: e.mode == Mode.rec, activeColor: cRec),
+        b('REC', () => e.setMode(Mode.rec), active: e.mode == Mode.rec, activeColor: cRec),
         b(e.playing ? 'STOP' : 'PLAY', e.togglePlay,
             active: e.playing, activeColor: const Color(0xFF7BD389)),
       ]),
@@ -299,7 +385,7 @@ class _DevicePageState extends State<DevicePage> {
 
   Widget _grid() {
     return LayoutBuilder(builder: (context, c) {
-      final size = (c.maxWidth < c.maxHeight ? c.maxWidth : c.maxHeight);
+      final size = c.maxWidth < c.maxHeight ? c.maxWidth : c.maxHeight;
       return Center(
         child: SizedBox(
           width: size,
@@ -330,10 +416,7 @@ class _DevicePageState extends State<DevicePage> {
         decoration: BoxDecoration(
           color: lit ? onColor : cPad,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: head ? cText : Colors.transparent,
-            width: 2,
-          ),
+          border: Border.all(color: head ? cText : Colors.transparent, width: 2),
           boxShadow: lit
               ? [BoxShadow(color: onColor.withValues(alpha: 0.55), blurRadius: 14)]
               : const [],
@@ -344,11 +427,9 @@ class _DevicePageState extends State<DevicePage> {
             alignment: Alignment.topLeft,
             child: Text('${i + 1}',
                 style: TextStyle(
-                    color: lit ? cLcdInk : cDim,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700)),
+                    color: lit ? cLcdInk : cDim, fontSize: 11, fontWeight: FontWeight.w700)),
           ),
-          if (e.userSample[i] && (e.mode == Mode.sound || rec))
+          if (e.padIsMic(i) && (e.mode == Mode.sound || rec))
             const Align(
               alignment: Alignment.topRight,
               child: Icon(Icons.mic, size: 12, color: cText),
@@ -374,18 +455,95 @@ class _DevicePageState extends State<DevicePage> {
     showModalBottomSheet(
       context: context,
       backgroundColor: cBody,
-      builder: (_) => const Padding(
-        padding: EdgeInsets.all(20),
-        child: Text(
-          'SOUND : touche un pad pour jouer et choisir son son.\n'
-          'WRITE : les pads deviennent les 16 pas du son choisi. '
-          'Appui long sur WRITE = efface la piste.\n'
-          'PATTERN : choisis un des 16 patterns.\n'
-          'FX : garde le doigt sur un pad pour appliquer l\'effet, relâche pour revenir.\n'
-          'REC : garde le doigt sur un pad et parle, tape ou fais du bruit. '
-          'Relâche pour enregistrer le son dans ce pad (6 s max).\n'
-          'PLAY : lance ou arrête le séquenceur.',
-          style: TextStyle(color: cText, height: 1.5),
+      isScrollControlled: true,
+      builder: (_) => const SafeArea(
+        child: SingleChildScrollView(
+          padding: EdgeInsets.all(20),
+          child: Text(
+            'SOUND : touche un pad pour le jouer. Appui long = choisir son son '
+            '(50 sons, 4 kits), l\'accorder et régler son volume.\n\n'
+            'WRITE : les pads deviennent les 16 pas du son choisi. '
+            'Appui long sur WRITE = efface la piste.\n\n'
+            'PATTERN : touche un pad pour choisir le pattern. Appui long = copier le '
+            'pattern courant ici, l\'effacer, ou l\'ajouter à l\'arrangement.\n\n'
+            'SONG : construis ton morceau en enchaînant les patterns, réordonne-les '
+            'et active la lecture de l\'arrangement.\n\n'
+            'FX : garde le doigt sur un pad pour appliquer l\'effet.\n\n'
+            'REC : garde le doigt sur un pad et fais du bruit, relâche. Le souffle '
+            'du micro est nettoyé automatiquement (6 s max). Laisse une demi-seconde '
+            'de silence avant le son pour un nettoyage optimal.\n\n'
+            'Tout est sauvegardé automatiquement.',
+            style: TextStyle(color: cText, height: 1.5),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class BpmSheet extends StatefulWidget {
+  final Engine engine;
+  const BpmSheet({super.key, required this.engine});
+  @override
+  State<BpmSheet> createState() => _BpmSheetState();
+}
+
+class _BpmSheetState extends State<BpmSheet> {
+  final List<int> _taps = [];
+
+  void _tap() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_taps.isNotEmpty && now - _taps.last > 2000) _taps.clear();
+    _taps.add(now);
+    if (_taps.length > 5) _taps.removeAt(0);
+    if (_taps.length >= 2) {
+      final avg = (_taps.last - _taps.first) / (_taps.length - 1);
+      widget.engine.setBpm((60000 / avg).round());
+    }
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final e = widget.engine;
+    return ListenableBuilder(
+      listenable: e,
+      builder: (context, _) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text('${e.bpm} BPM',
+                style: const TextStyle(
+                    color: cText, fontSize: 28, fontWeight: FontWeight.w900)),
+            Slider(
+              value: e.bpm.toDouble(),
+              min: 60,
+              max: 200,
+              divisions: 140,
+              onChanged: (v) => e.setBpm(v.round()),
+            ),
+            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              for (final d in [-5, -1, 1, 5])
+                Padding(
+                  padding: const EdgeInsets.all(4),
+                  child: OutlinedButton(
+                    onPressed: () => e.setBpm(e.bpm + d),
+                    child: Text(d > 0 ? '+$d' : '$d'),
+                  ),
+                ),
+            ]),
+            const SizedBox(height: 8),
+            Wrap(spacing: 8, children: [
+              for (final preset in [128, 138, 145, 150, 160])
+                ActionChip(label: Text('$preset'), onPressed: () => e.setBpm(preset)),
+            ]),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              height: 56,
+              child: FilledButton(onPressed: _tap, child: const Text('TAP TEMPO')),
+            ),
+          ]),
         ),
       ),
     );
