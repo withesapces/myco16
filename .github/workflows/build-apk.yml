@@ -1,0 +1,57 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Générer le dossier Android
+        run: |
+          flutter create --platforms=android --org com.webeedigital --project-name myco16 .
+          rm -rf test
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          sed -i '0,/<manifest[^>]*>/s//&\n    <uses-permission android:name="android.permission.RECORD_AUDIO"\/>/' "$MANIFEST"
+          sed -i 's/android:label="myco16"/android:label="MYCO-16"/' "$MANIFEST"
+          GRADLE=$(ls android/app/build.gradle* | head -1)
+          sed -i -E 's/minSdk = flutter\.minSdkVersion/minSdk = 24/; s/minSdkVersion flutter\.minSdkVersion/minSdkVersion 24/' "$GRADLE"
+          grep -n "uses-permission\|label" "$MANIFEST"
+          grep -n "minSdk" "$GRADLE"
+
+      - run: flutter pub get
+
+      - name: Analyse
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Compiler l'APK
+        run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: myco16-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publier en release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: MYCO-16 build ${{ github.run_number }}
+          files: build/app/outputs/flutter-apk/app-release.apk
