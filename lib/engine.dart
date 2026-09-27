@@ -2,7 +2,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_soloud/flutter_soloud.dart';
@@ -105,7 +104,7 @@ class Engine extends ChangeNotifier {
     if (src == null) return;
     flash[slot] = DateTime.now().millisecondsSinceEpoch;
     try {
-      final h = await _sl.play(src, volume: vol);
+      final h = _sl.play(src, volume: vol);
       if (speed != 1) _sl.setRelativePlaySpeed(h, speed);
     } catch (_) {}
   }

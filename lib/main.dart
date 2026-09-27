@@ -230,7 +230,9 @@ class _DevicePageState extends State<DevicePage> {
                   decoration: BoxDecoration(
                     color: head
                         ? cLcdInk
-                        : (on ? cLcdInk.withOpacity(0.45) : cLcdInk.withOpacity(0.1)),
+                        : (on
+                            ? cLcdInk.withValues(alpha: 0.45)
+                            : cLcdInk.withValues(alpha: 0.1)),
                     borderRadius: BorderRadius.circular(2),
                   ),
                 ),
@@ -333,7 +335,7 @@ class _DevicePageState extends State<DevicePage> {
             width: 2,
           ),
           boxShadow: lit
-              ? [BoxShadow(color: onColor.withOpacity(0.55), blurRadius: 14)]
+              ? [BoxShadow(color: onColor.withValues(alpha: 0.55), blurRadius: 14)]
               : const [],
         ),
         padding: const EdgeInsets.all(7),
