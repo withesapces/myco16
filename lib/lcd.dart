@@ -800,7 +800,9 @@ class _LcdScreenState extends State<LcdScreen> with SingleTickerProviderStateMix
           borderRadius: BorderRadius.circular(8),
           boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 6, spreadRadius: -2)],
         ),
-        child: CustomPaint(painter: LcdPainter(e, _buf)),
+        // SizedBox.expand : sans lui, le CustomPaint (sans enfant) prend une
+        // taille nulle dans la Row et tout l'écran est dessiné hors cadre.
+        child: SizedBox.expand(child: CustomPaint(painter: LcdPainter(e, _buf))),
       ),
     );
   }
