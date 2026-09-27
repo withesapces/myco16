@@ -12,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 
 import 'dsp.dart';
+import 'pet.dart';
 import 'sampler.dart';
 import 'synth.dart';
 
@@ -120,6 +121,7 @@ class Engine extends ChangeNotifier {
   final SoLoud _sl = SoLoud.instance;
   final AudioRecorder _rec = AudioRecorder();
   final Random _rnd = Random();
+  final Pet pet = Pet();
 
   // ── état ──
   final List<Slot> slots = List<Slot>.generate(16, emptySlot);
@@ -201,6 +203,7 @@ class Engine extends ChangeNotifier {
     try {
       await _sl.init(bufferSize: 512);
       _dir = await getApplicationDocumentsDirectory();
+      await pet.load(_dir!);
       final loaded = await _loadProject();
       if (!loaded) {
         for (var i = 0; i < 16; i++) {
@@ -474,6 +477,7 @@ class Engine extends ChangeNotifier {
   }
 
   void _barEnd() {
+    pet.onBar();
     if (_switchAtBar) {
       _switchAtBar = false;
       chainIndex = 0;
@@ -486,6 +490,13 @@ class Engine extends ChangeNotifier {
 
   // ═════════════ boutons ═════════════
   void _touch() => lastActivityMs = _now;
+
+  /// Tape sur l'écran LCD : caresser Myco ou nettoyer ses spores.
+  void tapPet() {
+    _touch();
+    pet.tap();
+    notifyListeners();
+  }
 
   void _lcd(String t) {
     lcdText = t;
@@ -645,6 +656,7 @@ class Engine extends ChangeNotifier {
           _loopNextUs = _sw.elapsedMicroseconds;
         }
         _lcd(kFxShort[k]);
+        pet.onFx();
       }
       if (writeMode) _changed();
       notifyListeners();
@@ -840,6 +852,7 @@ class Engine extends ChangeNotifier {
     slots[sound] = s;
     await _warmSlot(sound);
     _trigger(sound, lastNote[sound]);
+    pet.onMeal(1);
     _changed();
   }
 
@@ -850,6 +863,7 @@ class Engine extends ChangeNotifier {
     slots[sound] = s;
     await _warmSlot(sound);
     _trigger(sound, lastNote[sound]);
+    pet.onMeal(1);
     _changed();
   }
 
@@ -935,6 +949,7 @@ class Engine extends ChangeNotifier {
       await _warmSlot(slot);
       _trigger(slot, drum ? 0 : 7);
       _lcd(drum ? '${slots[slot].sliceCount}SL' : 'OK');
+      pet.onMeal(2);
       _changed();
       return null;
     } catch (e) {
@@ -1068,6 +1083,7 @@ class Engine extends ChangeNotifier {
     _timer?.cancel();
     _saveTimer?.cancel();
     _saveProject();
+    pet.save();
     _rec.dispose();
     _sl.deinit();
     super.dispose();
