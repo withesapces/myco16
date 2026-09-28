@@ -158,6 +158,9 @@ class Engine extends ChangeNotifier {
   final Map<Btn, bool> _usedWhileHeld = {};
   final Map<Btn, int> _downAt = {};
   bool _chainStarted = false;
+  // copie armée : WRITE pressé pendant que PATTERN ou SOUND est tenu
+  bool _copyArm = false;
+  bool get copyArmed => _copyArm;
   bool _switchAtBar = false;
 
   // horloge
@@ -517,6 +520,15 @@ class Engine extends ChangeNotifier {
     held.add(b);
     _usedWhileHeld[b] = false;
     _downAt[b] = _now;
+    // copie : PATTERN (ou SOUND) tenu + un appui sur WRITE, dans n'importe
+    // quel ordre. WRITE n'a pas besoin de rester enfoncé.
+    final copyCombo = (b == Btn.write && (held.contains(Btn.pattern) || held.contains(Btn.sound))) ||
+        ((b == Btn.pattern || b == Btn.sound) && held.contains(Btn.write));
+    if (copyCombo && !held.contains(Btn.record)) {
+      _copyArm = true;
+      _usedWhileHeld[Btn.write] = true;
+      _lcd('CPY');
+    }
     switch (b) {
       case Btn.play:
         togglePlay();
@@ -552,6 +564,11 @@ class Engine extends ChangeNotifier {
 
   void btnUp(Btn b) {
     held.remove(b);
+    if ((b == Btn.pattern || b == Btn.sound) &&
+        !held.contains(Btn.pattern) &&
+        !held.contains(Btn.sound)) {
+      _copyArm = false;
+    }
     final tap = _usedWhileHeld[b] != true && _now - (_downAt[b] ?? 0) < 450;
     if (tap) {
       switch (b) {
@@ -589,7 +606,7 @@ class Engine extends ChangeNotifier {
       return recStart(k);
     }
     if (held.contains(Btn.sound)) {
-      if (held.contains(Btn.write)) {
+      if (held.contains(Btn.write) || _copyArm) {
         slots[k] = cur.copy();
         _invalidate(k);
         await _warmSlot(k);
@@ -602,9 +619,9 @@ class Engine extends ChangeNotifier {
       return null;
     }
     if (held.contains(Btn.pattern)) {
-      if (held.contains(Btn.write)) {
-        patterns[k].copyFrom(patterns[pattern]);
-        _lcd('P${k + 1}');
+      if (held.contains(Btn.write) || _copyArm) {
+        if (k != pattern) patterns[k].copyFrom(patterns[pattern]);
+        _lcd(k == pattern ? 'SAME' : 'CPY');
         _changed();
         return null;
       }

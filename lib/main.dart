@@ -80,6 +80,8 @@ class _DevicePageState extends State<DevicePage> {
   String _keyLabel(int k) {
     final h = e.held;
     if (h.contains(Btn.record)) return e.slots[k].isEmpty ? 'REC' : e.slots[k].name;
+    if (e.copyArmed && h.contains(Btn.sound)) return k == e.sound ? '(ici)' : 'COPIER';
+    if (e.copyArmed && h.contains(Btn.pattern)) return k == e.pattern ? '(ici)' : 'COPIER';
     if (h.contains(Btn.sound)) return e.slots[k].name;
     if (h.contains(Btn.pattern)) {
       final inChain = e.chain.length > 1 && e.chain.contains(k);
@@ -370,7 +372,7 @@ class _DevicePageState extends State<DevicePage> {
               'SOUND + touche : choisir le son.',
               'RECORD + touche (maintenus) : enregistrer au micro dans ce slot. Le souffle est nettoyé, les enregistrements batterie sont découpés automatiquement. Mémoire totale : 40 s.',
               'RECORD + SOUND : supprimer le son courant.',
-              'WRITE + SOUND + touche : copier le son courant vers ce slot.',
+              'Copier un son : garde SOUND, appuie une fois sur WRITE (l\'écran affiche CPY, les touches affichent COPIER), puis tape le slot de destination.',
             ]),
             _HelpSection('KNOBS A / B', [
               'Toucher FX (sans touche) change le mode des knobs : TON (hauteur / volume), FLT (filtre passe-bas ↔ passe-haut / résonance), TRM (début / longueur du son ; en batterie, la dernière tranche jouée).',
@@ -385,8 +387,8 @@ class _DevicePageState extends State<DevicePage> {
             ]),
             _HelpSection('PATTERNS', [
               'PATTERN + touche : choisir le pattern (bascule à la fin de la mesure pendant la lecture).',
-              'PATTERN + plusieurs touches à la suite : chaîner les patterns (jusqu\'à 128, répétitions permises).',
-              'WRITE + PATTERN + touche : copier le pattern courant vers cette touche.',
+              'PATTERN + plusieurs touches à la suite : chaîner les patterns (jusqu\'à 128, répétitions permises). Une ♪ marque les patterns de la chaîne ; PATTERN + une seule touche revient à un pattern seul.',
+              'Copier un pattern : garde PATTERN, appuie une fois sur WRITE (CPY), puis tape la touche de destination. Pas besoin de garder WRITE enfoncé.',
               'RECORD + PATTERN : effacer le pattern courant.',
               'Menu ☰ > Arrangement : voir et réordonner la chaîne.',
             ]),
